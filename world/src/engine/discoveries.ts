@@ -1,0 +1,98 @@
+import { M } from './materials.ts';
+
+// Every reaction or phenomenon the engine can produce. The engine calls world.find(id)
+// when one actually happens; nothing here is scripted. `unlocks` adds materials or tools
+// to the player's palette the first time the phenomenon is seen.
+export interface Discovery { id: string; name: string; text: string; group: string; unlocks?: number[]; tools?: string[] }
+
+export const DISCOVERIES: Discovery[] = [
+  // heat & phase
+  { id: 'boil', group: 'Heat', name: 'Boiling', text: 'Water above 100 C turns to steam.', unlocks: [M.Steam] },
+  { id: 'condense', group: 'Heat', name: 'Rain', text: 'Steam that cools as it rises condenses back into water.' },
+  { id: 'freeze', group: 'Heat', name: 'Freezing', text: 'Water below 0 C turns to ice.' },
+  { id: 'melt', group: 'Heat', name: 'Thaw', text: 'Ice above 0 C melts.' },
+  { id: 'snowfall', group: 'Heat', name: 'Snowfall', text: 'Vapour that freezes high in the cold air falls as snow.', unlocks: [M.Snow] },
+  { id: 'snow-melt', group: 'Heat', name: 'Slush', text: 'Snow melts when it warms.' },
+  { id: 'stone-melts', group: 'Heat', name: 'Magma', text: 'Stone melts into lava above 1150 C.' },
+  { id: 'lava-cools', group: 'Heat', name: 'Cooling crust', text: 'Lava that loses its heat hardens into stone.' },
+  { id: 'sand-glass', group: 'Heat', name: 'Glassmaking', text: 'Sand fuses into glass at 1400 C.', unlocks: [M.Glass] },
+  { id: 'red-hot', group: 'Heat', name: 'Red hot', text: 'Metal glows as it heats past 600 C.' },
+  { id: 'metal-melts', group: 'Heat', name: 'Foundry', text: 'Metal melts at 1500 C.' },
+  { id: 'dry-out', group: 'Heat', name: 'Drought', text: 'Heat drives the water out of wet soil as steam.' },
+  { id: 'acid-fumes', group: 'Heat', name: 'Fumes', text: 'Boiling acid turns into choking smoke.' },
+  { id: 'heat-rises', group: 'Heat', name: 'Convection', text: 'Hot air rises and drags smoke and embers with it.' },
+  { id: 'cold-top', group: 'Heat', name: 'Thin air', text: 'The sky is colder the higher you go.' },
+  // fire
+  { id: 'wood-burn', group: 'Fire', name: 'Campfire', text: 'Wood burns slowly and leaves ash.', unlocks: [M.Fire, M.Ash, M.Smoke] },
+  { id: 'oil-burn', group: 'Fire', name: 'Oil fire', text: 'Oil burns hot and smoky, even while floating on water.', unlocks: [M.Fire, M.Smoke] },
+  { id: 'plant-burn', group: 'Fire', name: 'Wildfire', text: 'Living plants catch and spread fire.' },
+  { id: 'fungus-burn', group: 'Fire', name: 'Smoulder', text: 'Fungus burns too.' },
+  { id: 'bug-burn', group: 'Fire', name: 'Singed', text: 'Bugs die in fire.' },
+  { id: 'seed-burn', group: 'Fire', name: 'Popcorn', text: 'Seeds burn up in heat.' },
+  { id: 'douse', group: 'Fire', name: 'Doused', text: 'Water puts out burning things and flashes to steam.' },
+  { id: 'smother', group: 'Fire', name: 'Smothered', text: 'Fire with no air around it goes out.' },
+  { id: 'fire-ice', group: 'Fire', name: 'Meltwater', text: 'Flame melts ice and snow.' },
+  { id: 'explosion', group: 'Fire', name: 'Detonation', text: 'Hot gunpowder explodes and sets off its neighbours.', tools: ['bomb'] },
+  { id: 'methane-burn', group: 'Fire', name: 'Gas flash', text: 'Methane burns in a sudden flash.' },
+  { id: 'hydrogen-burn', group: 'Fire', name: 'Burning water', text: 'Hydrogen burns into water vapour.' },
+  { id: 'shatter', group: 'Fire', name: 'Shatter', text: 'A blast breaks glass back into sand.' },
+  { id: 'crumble', group: 'Fire', name: 'Rubble', text: 'A blast crumbles stone into sand.' },
+  { id: 'fireball', group: 'Fire', name: 'Fireball', text: 'Big blasts throw burning debris.' },
+  // water & chemistry
+  { id: 'dissolve', group: 'Chemistry', name: 'Solution', text: 'Salt dissolves into water, making brine.', unlocks: [M.SaltWater] },
+  { id: 'salt-ice', group: 'Chemistry', name: 'Road salt', text: 'Salt melts ice even below freezing.' },
+  { id: 'desalinate', group: 'Chemistry', name: 'Salt flats', text: 'Boiling brine leaves its salt behind.' },
+  { id: 'brine-freeze', group: 'Chemistry', name: 'Deep freeze', text: 'Brine only freezes below -21 C.' },
+  { id: 'halocline', group: 'Chemistry', name: 'Halocline', text: 'Brine sinks under fresh water.' },
+  { id: 'float', group: 'Chemistry', name: 'Oil slick', text: 'Oil floats on water.' },
+  { id: 'obsidian', group: 'Chemistry', name: 'Obsidian', text: 'Lava quenched by water turns to volcanic glass.', unlocks: [M.Obsidian] },
+  { id: 'acid-metal', group: 'Chemistry', name: 'Fizz', text: 'Acid eats metal and releases hydrogen.', unlocks: [M.Hydrogen] },
+  { id: 'acid-stone', group: 'Chemistry', name: 'Etching', text: 'Acid eats stone and gives off fumes.' },
+  { id: 'corrode', group: 'Chemistry', name: 'Corrosion', text: 'Acid dissolves wood, soil and living things.' },
+  { id: 'dilute', group: 'Chemistry', name: 'Dilution', text: 'Acid mixed with water weakens and warms.' },
+  { id: 'neutralize', group: 'Chemistry', name: 'Neutralised', text: 'Ash is alkaline: it turns acid into water.' },
+  { id: 'acid-glass', group: 'Chemistry', name: 'Acid-proof', text: 'Acid cannot eat glass, so glass can hold it.' },
+  { id: 'rust', group: 'Chemistry', name: 'Rust', text: 'Wet metal slowly rusts.', unlocks: [M.Rust] },
+  { id: 'rust-salt', group: 'Chemistry', name: 'Sea air', text: 'Brine rusts metal far faster.' },
+  // electricity
+  { id: 'current', group: 'Electricity', name: 'Current', text: 'A battery sends pulses through metal.' },
+  { id: 'wet-current', group: 'Electricity', name: 'Live water', text: 'Electricity spreads through water.' },
+  { id: 'electrolysis', group: 'Electricity', name: 'Electrolysis', text: 'Current splits water into hydrogen bubbles.', unlocks: [M.Hydrogen] },
+  { id: 'spark-ignite', group: 'Electricity', name: 'Spark', text: 'A spark sets off anything flammable next to it.' },
+  { id: 'electrocute', group: 'Electricity', name: 'Zapped', text: 'Current kills bugs.' },
+  { id: 'resist-heat', group: 'Electricity', name: 'Heating element', text: 'Current warms the metal it flows through.' },
+  { id: 'lightning', group: 'Electricity', name: 'Lightning', text: 'A bolt heats, sparks and electrifies what it hits.' },
+  { id: 'fulgurite', group: 'Electricity', name: 'Fulgurite', text: 'Lightning fuses sand into glass.', unlocks: [M.Glass] },
+  // life
+  { id: 'soak', group: 'Life', name: 'Mud', text: 'Soil soaks up water.' },
+  { id: 'sprout', group: 'Life', name: 'Sprout', text: 'A seed on wet soil sprouts.', unlocks: [M.Plant] },
+  { id: 'plant-drinks', group: 'Life', name: 'Thirst', text: 'Plants drink water and pass it up to their tips.' },
+  { id: 'phototropism', group: 'Life', name: 'Reaching', text: 'Growing tips stall in shadow.' },
+  { id: 'bloom', group: 'Life', name: 'Bloom', text: 'A plant that reaches full height flowers.' },
+  { id: 'reproduce', group: 'Life', name: 'Seedfall', text: 'Flowers drop new seeds.' },
+  { id: 'frostbite', group: 'Life', name: 'Frost', text: 'Freezing kills plants.' },
+  { id: 'salted-earth', group: 'Life', name: 'Salted earth', text: 'Brine kills plants.' },
+  { id: 'bug-eats', group: 'Life', name: 'Grazing', text: 'Bugs eat plants, seeds and fungus.' },
+  { id: 'bug-breeds', group: 'Life', name: 'Swarm', text: 'Well-fed bugs breed.' },
+  { id: 'starve', group: 'Life', name: 'Compost', text: 'Starving bugs rot into rich soil.' },
+  { id: 'bug-drown', group: 'Life', name: 'Drowned', text: 'Bugs cannot swim.' },
+  { id: 'bug-cold', group: 'Life', name: 'Winter', text: 'Bugs freeze to death below -5 C.' },
+  { id: 'fertilize', group: 'Life', name: 'Fertiliser', text: 'Ash on soil makes it rich; plants grow taller there.' },
+  { id: 'fungus-appears', group: 'Life', name: 'Mould', text: 'Damp dark soil next to wood grows fungus.', unlocks: [M.Fungus] },
+  { id: 'decompose', group: 'Life', name: 'Decay', text: 'Fungus digests wood.' },
+  { id: 'fungus-light', group: 'Life', name: 'Sunburn', text: 'Fungus dies in the light.' },
+  { id: 'swamp-gas', group: 'Life', name: 'Swamp gas', text: 'Rotting fungus breathes out methane.', unlocks: [M.Methane] },
+  // weather & forces
+  { id: 'wind-blown', group: 'Weather', name: 'Drift', text: 'Wind carries light powders like ash, snow and seeds.' },
+  { id: 'waves', group: 'Weather', name: 'Waves', text: 'Wind pushes water around.' },
+  { id: 'shockwave', group: 'Weather', name: 'Shockwave', text: 'Explosions push the air, and the air pushes everything else.' },
+];
+
+export const DISCOVERY_BY_ID = new Map(DISCOVERIES.map(d => [d.id, d]));
+
+// Tools that must be earned. Everything else is available at the start.
+export const TOOL_UNLOCKS: Record<string, { after?: string; count?: number }> = {
+  bomb: { after: 'explosion' },
+  time: { count: 10 },
+  gravity: { count: 20 },
+};

@@ -26,3 +26,18 @@ Keys 1–8 switch tabs.
 Vercel uses `vercel.json`, which runs the same build and serves `_site/`.
 
 To run locally: `./scripts/build.sh` then open `_site/index.html`.
+
+## Terrarium (world simulator)
+
+The Sand tab has a **Terrarium ✦** chip that opens a full world simulator: 29 materials with temperature,
+phase changes, combustion, air pressure and wind, electricity, plants, fungus and bugs, 74 discoverable
+reactions, god tools (heat, freeze, wind, rain, lightning, blast, gravity, local time), undo, save slots,
+share codes and debug views. Open it directly with `#terrarium`.
+
+Source lives in `world/` (TypeScript engine + WebGL2 renderer). To change it:
+
+```sh
+cd world && npm install && npm test && npm run build && cd .. && python3 scripts/inline-world.py
+```
+
+That inlines `world/dist/terrarium.js` into `swirl-room.html`, which stays one self-contained file.
