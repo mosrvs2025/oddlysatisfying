@@ -7,6 +7,7 @@ export const CSS = `
 .tr-top{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:calc(env(safe-area-inset-top,0px) + 10px) 12px 0;pointer-events:none}
 .tr-top>*{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:0}
 .tr-ib{width:38px;height:38px;display:grid;place-items:center;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(20,22,32,.66);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);cursor:pointer;padding:0;flex:none}
+.tr-ib.on{background:#eef0f7;color:#0b0d13}
 .tr-ib:disabled{opacity:.35;cursor:default}
 .tr-speed{font:700 13px/1 inherit;font-variant-numeric:tabular-nums}
 .tr-title{border:0;background:none;text-align:left;cursor:pointer;padding:2px 4px;min-width:0;text-shadow:0 1px 10px rgba(0,0,0,.7)}

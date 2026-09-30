@@ -32,6 +32,8 @@ export class World {
   shocks: Shock[] = []; bolts: Bolt[] = []; sparks: number[] = [];
   wells: { x: number; y: number; r: number }[] = [];
   timeZones: { x: number; y: number; r: number }[] = [];
+  /** Spinning storms. They live on their own once started: drift with the wind, lift what they pass over, and spin down. */
+  storms: { x: number; y: number; r: number; life: number; spin: number }[] = [];
   stats = { explosions: 0 };
 
   constructor(w: number, h: number, seed = 1) {
@@ -105,6 +107,7 @@ export class World {
     this.thermal(0, 0, this.w, this.h);
     this.electric();
     this.debris.step(this);
+    if (this.storms.length) this.stepStorms();
     for (const z of this.timeZones) {
       const x0 = Math.max(0, z.x - z.r), y0 = Math.max(0, z.y - z.r), x1 = Math.min(this.w, z.x + z.r), y1 = Math.min(this.h, z.y + z.r);
       for (let k = 0; k < 3; k++) { this.gen = (this.gen + 1) & 255; this.updateCells(x0, y0, x1, y1); this.thermal(x0, y0, x1, y1); }
@@ -165,8 +168,17 @@ export class World {
     const ph = PHASE[t];
     return (ph === Phase.Liquid || ph === Phase.Gas) && DENSITY[m] > DENSITY[t];
   }
+  /** Anything lighter than the liquid above it bobs up through it (oil in water, seeds and ash in a pond). */
+  rise(i: number, y: number, m: number) {
+    if (y === 0) return false;
+    const a = i - this.w, t = this.mat[a];
+    if (PHASE[t] !== Phase.Liquid || DENSITY[t] <= DENSITY[m] || !this.one(2)) return false;
+    if (m === M.Oil && t === M.Water) this.find('float');
+    this.swap(i, a); return true;
+  }
   movePowder(i: number, x: number, y: number, m: number) {
     const w = this.w, h = this.h;
+    if (this.rise(i, y, m)) return;
     // wind lifts light powders
     const bl = BLOWABLE[m];
     if (bl > 0) {
@@ -203,6 +215,7 @@ export class World {
   moveLiquid(i: number, x: number, y: number, m: number) {
     const w = this.w, h = this.h, mat = this.mat;
     if (m === M.Lava && !this.one(3)) return; // viscous
+    if (this.rise(i, y, m)) return;
     let cur = i, cy = y, moved = false;
     const steps = 1 + (this.vel[i] >> 1);
     for (let s = 0; s < steps; s++) {
@@ -259,6 +272,49 @@ export class World {
       if (ty < 0 && ph === Phase.Liquid && this.one(2)) { this.swap(i, j); return; } // bubbles rise through liquid
     }
   }
+
+  stepStorms() {
+    const w = this.w, h = this.h;
+    for (const s of this.storms) {
+      s.life--;
+      const k = Math.min(1, s.life / 120), R = s.r;
+      this.air.swirl(s.x, s.y, R * 2.2, s.spin * 1.4 * k);
+      // drift with the mean wind, and wander a little
+      s.x += this.air.vxAt(Math.max(0, Math.min(w - 1, s.x | 0)), Math.max(0, Math.min(h - 1, s.y | 0))) * .15 + (this.rf() - .5) * .4;
+      s.x = Math.max(2, Math.min(w - 3, s.x));
+      // the funnel reaches down to the ground and lifts loose things up into the spin
+      const n = 6 + (R >> 1);
+      for (let q = 0; q < n; q++) {
+        const px = Math.round(s.x + (this.rf() - .5) * R * .8);
+        let py = Math.round(s.y);
+        if (px < 0 || px >= w) continue;
+        while (py < h - 1 && (this.mat[py * w + px] === M.Empty || PHASE[this.mat[py * w + px]] === Phase.Gas)) py++;
+        if (py - s.y > R * 4) continue;
+        const i = py * w + px, t = this.mat[i], ph = PHASE[t];
+        if ((ph === Phase.Powder || ph === Phase.Liquid || t === M.Bug || t === M.Plant) && t !== M.Lava && this.rf() < .6 * k) {
+          if (this.debris.launch(this, i, s.spin * (1.2 + this.rf()), -1.6 - this.rf() * 2.2 * k)) {
+            this.find('tornado');
+            if (ph === Phase.Liquid) this.find('waterspout');
+          }
+        }
+      }
+      // big storms pull up moisture and dump it as rain bands that spiral out of the eye
+      if (R >= 14) {
+        for (let q = 0; q < 3; q++) {
+          const a = this.rf() * Math.PI * 2, d = R * (1 + this.rf() * 1.6);
+          const rx = Math.round(s.x + Math.cos(a) * d), ry = Math.max(1, Math.round(s.y - R * .6 + Math.sin(a) * d * .3));
+          if (rx >= 0 && rx < w && ry < h && this.mat[ry * w + rx] === M.Empty && this.one(2)) { this.spawn(ry * w + rx, M.Water, 8); this.find('hurricane'); }
+        }
+        if (this.one(90)) {
+          // lightning from the eyewall
+          const bx = Math.round(s.x + (this.rf() - .5) * R * 3);
+          if (bx >= 0 && bx < w) this.pendingBolts.push(bx);
+        }
+      }
+    }
+    this.storms = this.storms.filter(s => s.life > 0);
+  }
+  pendingBolts: number[] = [];
 
   // ---------- combustion ----------
   hasAir(x: number, y: number) {
@@ -616,6 +672,7 @@ export class World {
     const w = this.w, h = this.h, ch = this.charge, mat = this.mat;
     // batteries fire a pulse on a fixed beat
     const beat = this.tick % 12 === 0;
+    if (!beat && !this.eLive) return; // nothing is charged, so nothing can change until the next battery beat
     const next = this.nextCharge ?? (this.nextCharge = new Uint8Array(this.n));
     next.fill(0);
     let any = false;
@@ -631,7 +688,7 @@ export class World {
         if (cond >= 1 || this.rf() < cond) { next[i] = 1; any = true; }
       }
     }
-    this.charge = next; this.nextCharge = ch;
+    this.charge = next; this.nextCharge = ch; this.eLive = any;
     if (!any) return;
     // effects of live current
     for (let i = 0; i < this.n; i++) {
@@ -650,6 +707,7 @@ export class World {
     }
   }
   nextCharge: Uint8Array | null = null;
+  eLive = true;
 
   // ---------- inspection ----------
   count(m: number) { let c = 0; for (let i = 0; i < this.n; i++) if (this.mat[i] === m) c++; return c; }

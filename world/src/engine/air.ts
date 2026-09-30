@@ -86,6 +86,17 @@ export class Air {
       }
   }
   /** Directional push, as from the wind tool. */
+  /** A vortex: air circles the point (spin > 0 is clockwise on screen), with a gentle updraft in the core. */
+  swirl(x: number, y: number, r: number, spin: number) {
+    const S = Air.S, cx = x / S, cy = y / S, R = Math.max(1.5, r / S);
+    for (let j = Math.max(0, (cy - R) | 0); j <= Math.min(this.ch - 1, (cy + R) | 0); j++)
+      for (let i = Math.max(0, (cx - R) | 0); i <= Math.min(this.cw - 1, (cx + R) | 0); i++) {
+        const dx = i + .5 - cx, dy = j + .5 - cy, d = Math.hypot(dx, dy); if (d > R || d < .3) continue;
+        const f = (d / R) * (1 - d / R) * 4 * spin, c = j * this.cw + i;
+        this.vx[c] += (-dy / d) * f * .5 - dx / d * Math.abs(f) * .08;
+        this.vy[c] += (dx / d) * f * .5 - dy / d * Math.abs(f) * .08 - Math.abs(spin) * .06 * (1 - d / R);
+      }
+  }
   push(x: number, y: number, r: number, dx: number, dy: number) {
     const S = Air.S, cx = x / S, cy = y / S, R = Math.max(1, r / S);
     for (let j = Math.max(0, (cy - R) | 0); j <= Math.min(this.ch - 1, (cy + R) | 0); j++)

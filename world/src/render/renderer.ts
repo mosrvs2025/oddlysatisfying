@@ -119,10 +119,18 @@ void main(){ o = texture(uTex, vUv) * .227 + (texture(uTex, vUv + uDir * 1.385) 
 const COMP_FS = HEAD + `
 uniform sampler2D uColor, uGlow, uBloom, uLight; uniform vec2 uWorld, uScreen; uniform vec3 uCam; uniform float uTime;
 uniform vec4 uShock[8]; uniform int uShocks; uniform vec3 uBrush; uniform float uBrushOn; uniform float uAmbient;
+uniform vec4 uPlanet; uniform vec2 uPlanet2; // (on, cx, cy, rOut) and (rIn, rotation) in device pixels
 out vec4 o;
 void main(){
   vec2 px = vUv * uScreen; px.y = uScreen.y - px.y;
   vec2 w = (px - uScreen * .5) / uCam.z + uCam.xy;           // world cell coords
+  float pr = 0.;
+  if (uPlanet.x > .5) {
+    // globe view: the world is wrapped around a planet, sky outward, bedrock toward the core
+    vec2 d = px - uPlanet.yz; pr = length(d);
+    float ang = atan(d.x, -d.y) / 6.2831853;
+    w = vec2(fract(ang + uPlanet2.y) * uWorld.x, (uPlanet.w - pr) / (uPlanet.w - uPlanet2.x) * uWorld.y);
+  }
   // shockwaves bend space
   for (int k = 0; k < 8; k++) { if (k >= uShocks) break; vec4 s = uShock[k]; vec2 d = w - s.xy; float r = length(d); float ring = exp(-pow((r - s.z) / 3., 2.)) * s.w; w -= normalize(d + 1e-4) * ring * 3.; }
   vec2 uv = w / uWorld;
@@ -138,6 +146,16 @@ void main(){
   vec3 lit = c.rgb * (uAmbient + light * 1.6);
   vec3 col = mix(sky + light * .35, lit, c.a) + bloom * .9 + texture(uGlow, uv).rgb * .25;
   if (!inside) col = vec3(.03, .03, .05);
+  if (uPlanet.x > .5) {
+    float k = clamp(uv.y, 0., 1.);
+    vec3 space = vec3(.015, .018, .035);
+    vec2 sp = floor(px / 3.); float s2 = hash(sp);
+    if (s2 > .995) space += vec3(.7, .75, .9) * (.5 + .5 * sin(uTime * 2. + s2 * 90.));
+    float rimR = uPlanet.w - .3 * (uPlanet.w - uPlanet2.x), rim = exp(-pow((pr - rimR) / (uPlanet.w * .03), 2.));
+    if (pr > uPlanet.w) col = space + vec3(.25, .45, 1.) * rim * .8;
+    else if (uv.y < 1.) { float air = clamp(pow(k / .34, 3.), 0., 1.) * (1. - c.a); col = mix(space + light * .35 + bloom * .9, col, max(c.a, air * .8)) + vec3(.25, .45, 1.) * rim * .35 * (1. - c.a) + vec3(.03, .07, .18) * air; }
+    if (pr < uPlanet2.x) { float q = pr / uPlanet2.x; col = mix(vec3(1., .85, .4), vec3(.9, .25, .05), q) * (1.2 - q * .5) + vec3(.4, .1, 0.) * sin(uTime + q * 12.) * .1; }
+  }
   // brush ring
   if (uBrushOn > 0.) { float d = abs(length(w - uBrush.xy) - uBrush.z); col = mix(col, vec3(1.), (1. - smoothstep(0., 1.2 / uCam.z * 1.5, d)) * .55 * uBrushOn); }
   col = 1. - exp(-col * 1.25);
@@ -145,8 +163,13 @@ void main(){
 }`;
 
 const PT_VS = `#version 300 es
-in vec2 aPos; in vec4 aCol; uniform vec2 uWorld, uScreen; uniform vec3 uCam; uniform float uSize; out vec4 vCol;
-void main(){ vec2 p = (aPos - uCam.xy) * uCam.z + uScreen * .5; vec2 ndc = p / uScreen * 2. - 1.; ndc.y = -ndc.y; gl_Position = vec4(ndc, 0., 1.); gl_PointSize = uSize * uCam.z; vCol = aCol; }`;
+in vec2 aPos; in vec4 aCol; uniform vec2 uWorld, uScreen; uniform vec3 uCam; uniform float uSize; uniform vec4 uPlanet; uniform vec2 uPlanet2; out vec4 vCol;
+void main(){ vec2 p = (aPos - uCam.xy) * uCam.z + uScreen * .5;
+  float sz = uSize * uCam.z;
+  if (uPlanet.x > .5) {
+    float a = (aPos.x / uWorld.x - uPlanet2.y) * 6.2831853, r = uPlanet.w - aPos.y / uWorld.y * (uPlanet.w - uPlanet2.x);
+    p = uPlanet.yz + r * vec2(sin(a), -cos(a)); sz = uSize * (uPlanet.w - uPlanet2.x) / uWorld.y;
+  } vec2 ndc = p / uScreen * 2. - 1.; ndc.y = -ndc.y; gl_Position = vec4(ndc, 0., 1.); gl_PointSize = max(1., sz); vCol = aCol; }`;
 const PT_FS = `#version 300 es
 precision highp float; in vec4 vCol; out vec4 o; uniform float uRound;
 void main(){ float d = length(gl_PointCoord - .5); if (uRound > .5 && d > .5) discard; o = vec4(vCol.rgb * (uRound > .5 ? (1. - d * 1.6) : 1.), vCol.a); }`;
@@ -163,6 +186,8 @@ export class Renderer {
   private ptVao: WebGLVertexArrayObject; private ptBuf: WebGLBuffer; private ptData = new Float32Array(8000 * 6);
   embers: { x: number; y: number; vx: number; vy: number; life: number; r: number; g: number; b: number }[] = [];
   brush = { x: 0, y: 0, r: 0, on: 0 };
+  /** Globe view geometry in CSS pixels; rot is in turns. */
+  planet = { on: false, cx: 0, cy: 0, rOut: 1, rIn: 0, rot: 0 };
   ambient = .82;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -279,7 +304,9 @@ export class Renderer {
     this.embers = this.embers.filter(e => e.life > 0);
   }
 
+  private time = 0;
   render(cam: Camera, time: number) {
+    this.time = time;
     const gl = this.gl, W = this.world;
     this.upload();
     this.spawnEmbers(time);
@@ -308,16 +335,23 @@ export class Renderer {
     const sh = new Float32Array(32); let ns = 0;
     for (const s of W.shocks) { if (ns >= 8) break; const k = s.t / 40; sh.set([s.x, s.y, s.r * (1 + s.t * .9), (1 - k) * Math.min(1, s.r / 6)], ns * 4); ns++; }
     gl.uniform4fv(u.uShock, sh); gl.uniform1i(u.uShocks, ns);
+    this.planetUniforms(u, dpr);
     gl.uniform3f(u.uBrush, this.brush.x, this.brush.y, this.brush.r); gl.uniform1f(u.uBrushOn, this.brush.on);
     this.draw();
     // 4. debris, embers and lightning as points on top
     this.points(cam, dpr);
   }
 
+  private planetUniforms(u: Record<string, WebGLUniformLocation>, dpr: number) {
+    const P = this.planet;
+    this.gl.uniform4f(u.uPlanet, P.on ? 1 : 0, P.cx * dpr, P.cy * dpr, P.rOut * dpr);
+    this.gl.uniform2f(u.uPlanet2, P.rIn * dpr, P.rot);
+  }
   private points(cam: Camera, dpr: number) {
     const gl = this.gl, W = this.world, d = this.ptData;
     const u = this.use('pts');
     gl.uniform2f(u.uWorld, W.w, W.h); gl.uniform2f(u.uScreen, this.canvas.width, this.canvas.height); gl.uniform3f(u.uCam, cam.x, cam.y, cam.zoom * dpr);
+    this.planetUniforms(u, dpr);
     gl.bindVertexArray(this.ptVao); gl.bindBuffer(gl.ARRAY_BUFFER, this.ptBuf);
     // debris keep their material colour
     let n = 0;
@@ -329,6 +363,19 @@ export class Renderer {
     if (n) { gl.bufferSubData(gl.ARRAY_BUFFER, 0, d, 0, n * 6); gl.uniform1f(u.uSize, 1.05); gl.uniform1f(u.uRound, 0); gl.drawArrays(gl.POINTS, 0, n); }
     // embers and lightning glow additively
     n = 0;
+    // storm funnels: dust spiralling around each vortex, narrow at the ground and wide aloft
+    for (const st of W.storms) {
+      const k = Math.min(1, st.life / 120), sx = Math.max(0, Math.min(W.w - 1, st.x | 0));
+      let gy = Math.max(0, st.y | 0); while (gy < W.h - 1 && (W.mat[gy * W.w + sx] === 0 || MATS[W.mat[gy * W.w + sx]].phase === 4)) gy++;
+      const top = st.y - st.r * 1.2, big = st.r >= 14;
+      for (let q = 0; q < 420 && n < 6000; q++) {
+        const t = q / 420, y = gy + (top - gy) * t, rad = st.r * (big ? .5 + t * 1.6 : .12 + t * t * 1.1);
+        const a = this.time * st.spin * (big ? 2.5 : 7) / (.3 + t) + q * 2.399;
+        const x = st.x + Math.cos(a) * rad, depth = .5 + .5 * Math.sin(a);
+        const g = (.1 + .12 * depth) * k;
+        d.set([x, y, g, g, g * 1.2, 1], n * 6); n++;
+      }
+    }
     for (const e of this.embers) { if (n >= 7000) break; d.set([e.x, e.y, e.r * e.life, e.g * e.life, e.b * e.life, 1], n * 6); n++; }
     for (const b of W.bolts) {
       const f = Math.max(0, 1 - b.t / 14) * (b.t < 3 ? 1.6 : 1);

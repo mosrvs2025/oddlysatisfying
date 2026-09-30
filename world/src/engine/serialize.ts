@@ -7,7 +7,7 @@ export function snapshot(w: World): Snapshot {
 }
 export function restore(w: World, s: Snapshot) {
   w.mat.set(s.mat); w.aux.set(s.aux); w.life.set(s.life); w.flags.set(s.flags); w.vel.set(s.vel); w.temp.set(s.temp); w.charge.set(s.charge);
-  w.rngState = s.rng; w.tick = s.tick; w.debris.n = 0;
+  w.rngState = s.rng; w.tick = s.tick; w.debris.n = 0; w.eLive = true;
 }
 
 const MAGIC = 0x54455231; // "TER1"

@@ -1,20 +1,21 @@
 import { World } from './engine/world.ts';
 import { M, MATS, MAT_COUNT, PHASE, Phase } from './engine/materials.ts';
 import { DISCOVERIES, DISCOVERY_BY_ID, TOOL_UNLOCKS } from './engine/discoveries.ts';
-import { paint, erase, heat, wind, rain, bomb, gravityWell, timeWarp, lightning } from './engine/tools.ts';
+import { paint, erase, heat, wind, rain, bomb, gravityWell, timeWarp, lightning, storm, flushStormBolts } from './engine/tools.ts';
 import { snapshot, restore, toCode, fromCode, type Snapshot } from './engine/serialize.ts';
 import { Renderer, type Camera, type ViewMode } from './render/renderer.ts';
 import { makeScene, sizeFor, type SceneId } from './scenes.ts';
 import { CSS } from './styles.ts';
 import { Sound } from './sound.ts';
 
-type Tool = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time';
+type Tool = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'storm' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time';
 const TOOLS: { id: Tool; name: string; icon: string; tip: string }[] = [
   { id: 'paint', name: 'Paint', icon: '<path d="M4 20c2 0 4-1 4-3.5S10 13 12 13l6-9 2 2-9 6c0 2-3 3.5-3 5.5S6 20 4 20z"/>', tip: 'Paint the chosen material' },
   { id: 'erase', name: 'Erase', icon: '<path d="M8 20h12M5 15l8-8 5 5-6 6H8z"/>', tip: 'Remove anything' },
   { id: 'heat', name: 'Heat', icon: '<path d="M12 3c3 4 5 6 5 10a5 5 0 01-10 0c0-2 1-3.5 2-4.5.5 1.5 1.5 2.5 3 2.5-1-3 0-5 0-8z"/>', tip: 'Warm whatever is under your finger' },
   { id: 'cool', name: 'Freeze', icon: '<path d="M12 2v20M4 7l16 10M4 17l16-10M9 4l3 2 3-2M9 20l3-2 3 2"/>', tip: 'Chill whatever is under your finger' },
   { id: 'wind', name: 'Wind', icon: '<path d="M3 8h11a3 3 0 10-3-3M3 12h15a3 3 0 11-3 3M3 16h7"/>', tip: 'Drag to blow air the way you move' },
+  { id: 'storm', name: 'Storm', icon: '<path d="M4 5h16M6 9h12M8 13h8M10 17h4M11.5 21h1"/>', tip: 'Hold to spin up a storm. Small brush: tornado. Keep feeding a big one: hurricane' },
   { id: 'rain', name: 'Rain', icon: '<path d="M7 14a4 4 0 010-8 5 5 0 019.6 1.5A3.3 3.3 0 0117 14z"/><path d="M8 18l-1 3M12 18l-1 3M16 18l-1 3"/>', tip: 'Rain falls from the sky above your finger' },
   { id: 'bolt', name: 'Lightning', icon: '<path d="M13 2L5 13h6l-2 9 9-12h-6z"/>', tip: 'Tap to strike' },
   { id: 'bomb', name: 'Blast', icon: '<circle cx="11" cy="14" r="6.5"/><path d="M15.5 9.5L18 7M18 7l1.5-2M18 7l2 1"/>', tip: 'Tap to detonate' },
@@ -44,6 +45,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     <div class="tr-right">
       <button class="tr-ib" data-a="undo" aria-label="Undo">${svg('<path d="M9 7L4 12l5 5M4 12h11a5 5 0 010 10h-2"/>')}</button>
       <button class="tr-ib" data-a="redo" aria-label="Redo">${svg('<path d="M15 7l5 5-5 5M20 12H9a5 5 0 000 10h2"/>')}</button>
+      <button class="tr-ib" data-a="globe" aria-label="Globe view">${svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>')}</button>
       <button class="tr-ib" data-a="pause" aria-label="Pause"></button>
       <button class="tr-ib tr-speed" data-a="speed" aria-label="Speed">1×</button>
       <button class="tr-ib" data-a="menu" aria-label="Menu">${svg('<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>')}</button>
@@ -78,6 +80,23 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   let tool: Tool = store.get<Tool>("tool", "paint"), mat: number = store.get<number>("mat", M.Sand), brush: number = store.get('brush', 4);
   let paused = false, speed = 1, view: ViewMode = 'normal', debug = store.get('debug', false);
   const cam: Camera = { zoom: 1, x: 0, y: 0 };
+  // globe view: zoom 1 shows the whole planet; rot is in turns
+  const globe = { on: false, zoom: 1, rot: 0 };
+  function globeGeom() {
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    const base = Math.min(cw, ch - 150) * .6, rOut = base * globe.zoom;
+    // choose the core size so cells near the surface come out roughly square
+    const surf = .38, ratio = 2 * Math.PI / world.w * world.h; // rIn/rOut solving 2π·r_s/W = (rOut-rIn)/H
+    let k = (1 - ratio * (1 - surf)) / (1 + ratio * surf);
+    k = Math.max(.12, Math.min(.6, k));
+    const rIn = rOut * k, rs = rOut - surf * (rOut - rIn);
+    return { cx: cw / 2, cy: (ch - 110) / 2 + rs * (1 - 1 / globe.zoom), rOut, rIn, rs };
+  }
+  function setGlobe(on: boolean) {
+    globe.on = on; store.set('globe', on);
+    $('[data-a=globe]').classList.toggle('on', on);
+    if (on) showTip('Globe view. Drag with two fingers or right-drag to spin it, pinch to fly down to the surface');
+  }
   const undo: Snapshot[] = [], redo: Snapshot[] = [];
   let seed = (Math.random() * 2 ** 31) | 0;
 
@@ -88,7 +107,8 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   }
   let minZoom = 1;
   function newWorld(id: SceneId) {
-    const { w, h } = sizeFor(canvas.clientWidth / Math.max(1, canvas.clientHeight));
+    const { w, h } = id === 'planet' ? { w: 500, h: 132 } : sizeFor(canvas.clientWidth / Math.max(1, canvas.clientHeight));
+    if (id === 'planet' && !globe.on) setGlobe(true);
     seed = (seed * 1103515245 + 12345) >>> 0;
     setWorld(makeScene(id, w, h, seed));
     undo.length = 0; redo.length = 0;
@@ -179,7 +199,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const slots = [0, 1, 2].map(k => store.get<{ at: number; code: string } | null>('slot' + k, null));
     openSheet(`<h2>World</h2>
       <div class="tr-grid">
-        <button class="tr-btn" data-s="valley">New valley</button><button class="tr-btn" data-s="lab">New workshop</button><button class="tr-btn" data-s="empty">Empty world</button>
+        <button class="tr-btn" data-s="valley">New valley</button><button class="tr-btn" data-s="lab">New workshop</button><button class="tr-btn" data-s="planet">New planet</button><button class="tr-btn" data-s="empty">Empty world</button>
       </div>
       <h3>Save slots</h3>
       <div class="tr-slots">${slots.map((s, k) => `<div><span>Slot ${k + 1}${s ? ' · ' + new Date(s.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ' · empty'}</span><button class="tr-btn sm" data-save="${k}">Save</button><button class="tr-btn sm" data-load="${k}" ${s ? '' : 'disabled'}>Load</button></div>`).join('')}</div>
@@ -190,7 +210,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
       <div class="tr-grid">${(['normal', 'heat', 'air', 'charge'] as ViewMode[]).map(v => `<button class="tr-btn ${v === view ? 'on' : ''}" data-v="${v}">${{ normal: 'Normal', heat: 'Temperature', air: 'Air flow', charge: 'Electricity' }[v]}</button>`).join('')}</div>
       <label class="tr-check"><input type="checkbox" data-a="dbg" ${debug ? 'checked' : ''}> Performance readout</label>
       <label class="tr-check"><input type="checkbox" data-a="snd" ${snd.on ? 'checked' : ''}> Sound</label>
-      <p class="tr-lead">Keys: Space or right-drag pans, wheel zooms, [ and ] resize the brush, Ctrl+Z undo, P pause, 1 to 0 pick tools.</p>`, () => {
+      <p class="tr-lead">Keys: G globe view, Space or right-drag pans, wheel zooms, [ and ] resize the brush, Ctrl+Z undo, P pause, 1 to 0 pick tools.</p>`, () => {
       sheetBody.querySelectorAll<HTMLElement>('[data-s]').forEach(b => b.onclick = () => { newWorld(b.dataset.s as SceneId); sheet.hidden = true; updateTop(); });
       sheetBody.querySelectorAll<HTMLElement>('[data-save]').forEach(b => b.onclick = async () => { store.set('slot' + b.dataset.save, { at: Date.now(), code: await toCode(world) }); menu(); });
       sheetBody.querySelectorAll<HTMLElement>('[data-load]').forEach(b => b.onclick = async () => { const s = store.get<{ code: string } | null>('slot' + b.dataset.load, null); if (s) { pushUndo(); setWorld(await fromCode(s.code)); sheet.hidden = true; updateTop(); } });
@@ -216,6 +236,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     else if (a === 'shut') sheet.hidden = true;
     else if (a === 'undo') doUndo();
     else if (a === 'redo') doRedo();
+    else if (a === 'globe') setGlobe(!globe.on);
     else if (a === 'pause') { paused = !paused; updateTop(); }
     else if (a === 'speed') { speed = speed === 1 ? 2 : speed === 2 ? 4 : speed === 4 ? .5 : 1; updateTop(); }
   });
@@ -229,6 +250,11 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   let panning: { x: number; y: number } | null = null, spaceDown = false, hover = { x: -1, y: -1, in: false };
   const toWorld = (sx: number, sy: number) => {
     const r = canvas.getBoundingClientRect();
+    if (globe.on) {
+      const g = globeGeom(), dx = sx - r.left - g.cx, dy = sy - r.top - g.cy, pr = Math.hypot(dx, dy);
+      let a = Math.atan2(dx, -dy) / (2 * Math.PI) + globe.rot; a -= Math.floor(a);
+      return { x: a * world.w, y: (g.rOut - pr) / (g.rOut - g.rIn) * world.h };
+    }
     return { x: (sx - r.left - r.width / 2) / cam.zoom + cam.x, y: (sy - r.top - r.height / 2) / cam.zoom + cam.y };
   };
   function clampCam() {
@@ -256,7 +282,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
       if (paintHeld && paintHeld.hold < 8) doUndo();
       paintHeld = null;
       const [a, b] = [...ptrs.values()], cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2, w = toWorld(cx, cy);
-      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), cx, cy, zoom: cam.zoom, wx: w.x, wy: w.y };
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), cx, cy, zoom: globe.on ? globe.zoom : cam.zoom, wx: w.x, wy: w.y };
       return;
     }
     if (ptrs.size === 1) startStroke(e.clientX, e.clientY);
@@ -266,7 +292,14 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const w = toWorld(e.clientX, e.clientY); hover = { x: w.x, y: w.y, in: true };
     if (!p) return;
     p.x = e.clientX; p.y = e.clientY;
+    if (panning && globe.on) { globe.rot -= (e.clientX - panning.x) / (2 * Math.PI * globeGeom().rs); panning = { x: e.clientX, y: e.clientY }; return; }
     if (panning) { cam.x -= (e.clientX - panning.x) / cam.zoom; cam.y -= (e.clientY - panning.y) / cam.zoom; panning = { x: e.clientX, y: e.clientY }; clampCam(); return; }
+    if (pinch && ptrs.size >= 2 && globe.on) {
+      const [a, b] = [...ptrs.values()], cx = (a.x + b.x) / 2;
+      globe.zoom = Math.max(1, Math.min(8, pinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / Math.max(1, pinch.d)));
+      globe.rot -= (cx - pinch.cx) / (2 * Math.PI * globeGeom().rs); pinch.cx = cx;
+      return;
+    }
     if (pinch && ptrs.size >= 2) {
       const [a, b] = [...ptrs.values()], cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
       cam.zoom = pinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / Math.max(1, pinch.d); clampCam();
@@ -287,7 +320,9 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     if (e.altKey || e.shiftKey) { setBrush(brush + (e.deltaY > 0 ? -1 : 1)); return; }
-    zoomAt(e.clientX, e.clientY, cam.zoom * Math.exp(-e.deltaY * (e.deltaMode ? .05 : .0015)));
+    const f = Math.exp(-e.deltaY * (e.deltaMode ? .05 : .0015));
+    if (globe.on) { globe.zoom = Math.max(1, Math.min(8, globe.zoom * f)); return; }
+    zoomAt(e.clientX, e.clientY, cam.zoom * f);
   }, { passive: false });
   const onKey = (e: KeyboardEvent) => {
     if (!root.isConnected || root.hidden || (e.target as HTMLElement)?.tagName === 'TEXTAREA' || (e.target as HTMLElement)?.tagName === 'INPUT' && (e.target as HTMLInputElement).type !== 'range') return;
@@ -299,6 +334,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     else if (e.key === '[') setBrush(brush - 1);
     else if (e.key === ']') setBrush(brush + 1);
     else if (e.key === 'p' || e.key === 'P') { paused = !paused; updateTop(); }
+    else if (e.key === 'g' || e.key === 'G') setGlobe(!globe.on);
     else if (e.key === 'Escape') { if (!sheet.hidden) sheet.hidden = true; else opts.onClose?.(); }
     else { const k = '1234567890'.indexOf(e.key); if (k >= 0 && TOOLS[k] && toolUnlocked(TOOLS[k].id)) { tool = TOOLS[k].id; buildTools(); buildMats(); } }
     e.stopPropagation();
@@ -320,6 +356,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
       case 'cool': heat(world, p.x, p.y, r + 1, -40); break;
       case 'wind': { const s = Math.hypot(p.vx, p.vy); if (s > .05) wind(world, p.x, p.y, r, p.vx / s * Math.min(3, s * .8 + .6), p.vy / s * Math.min(3, s * .8 + .6)); break; }
       case 'rain': rain(world, p.x, r); break;
+      case 'storm': storm(world, p.x, p.y, r, p.vx < -.05 ? -1 : 1); break;
       case 'gravity': gravityWell(world, p.x, p.y, r); break;
       case 'time': timeWarp(world, p.x, p.y, r); break;
       case 'bolt': if (p.hold % 24 === 0) { lightning(world, p.x, p.y); snd.zap(); } break;
@@ -338,7 +375,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     if (!paused) {
       acc += dt * 60 * speed;
       let n = 0;
-      while (acc >= 1 && n < 4) { applyTool(); world.step(); acc -= 1; n++; }
+      while (acc >= 1 && n < 4) { applyTool(); world.step(); if (world.pendingBolts.length) { flushStormBolts(world); snd.zap(); } acc -= 1; n++; }
       if (acc > 4) acc = 0; // do not spiral when the device cannot keep up
     }
     if (paused && paintHeld) applyTool(); // painting still works while paused
@@ -352,6 +389,8 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const t1 = performance.now();
     const showBrush = paintHeld || hover.in;
     R.brush = { x: paintHeld ? paintHeld.x : hover.x, y: paintHeld ? paintHeld.y : hover.y, r: brush + .5, on: showBrush && !pinch ? (paintHeld ? .5 : 1) : 0 };
+    if (globe.on) { const g = globeGeom(); R.planet = { on: true, cx: g.cx, cy: g.cy, rOut: g.rOut, rIn: g.rIn, rot: globe.rot }; }
+    else R.planet.on = false;
     R.render(cam, now / 1000);
     renderMs = renderMs * .9 + (performance.now() - t1) * .1;
     if (debug && frame % 10 === 0) debugEl.textContent = `${fps.toFixed(0)} fps   sim ${simMs.toFixed(1)} ms   draw ${renderMs.toFixed(1)} ms\n${world.w}×${world.h} grid   ${cells} cells   ${world.debris.n} debris\ntick ${world.tick}   seed ${world.seed}   view ${view}`;
@@ -363,6 +402,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   // ---------------- start ----------------
   canvas.width = Math.round(canvas.clientWidth * dpr()); canvas.height = Math.round(canvas.clientHeight * dpr());
   newWorld('valley');
+  if (store.get('globe', false)) setGlobe(true);
   for (let k = 0; k < 30; k++) world.step(); // settle the scene before the first frame
   world.newFinds.length = 0;
   debugEl.hidden = !debug;

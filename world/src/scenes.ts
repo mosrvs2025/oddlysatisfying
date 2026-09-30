@@ -1,7 +1,7 @@
 import { World } from './engine/world.ts';
 import { M } from './engine/materials.ts';
 
-export type SceneId = 'valley' | 'empty' | 'lab';
+export type SceneId = 'valley' | 'empty' | 'lab' | 'planet';
 
 /** Pick a grid that fills the screen with about `cells` cells. */
 export function sizeFor(aspect: number, cells = 64000) {
@@ -14,6 +14,7 @@ export function makeScene(id: SceneId, w: number, h: number, seed: number): Worl
   const set = (x: number, y: number, m: number) => { if (W.inside(x, y)) W.spawn(y * w + x, m); };
   const r = () => W.rf();
   if (id === 'empty') return W;
+  if (id === 'planet') return planet(W);
   if (id === 'lab') {
     // a floor and a few things to wire up
     for (let x = 0; x < w; x++) for (let y = h - 6; y < h; y++) set(x, y, M.Stone);
@@ -62,6 +63,48 @@ export function makeScene(id: SceneId, w: number, h: number, seed: number): Worl
     if (Math.abs(x - pond) < w * .17 || Math.abs(x - logX - 8) < 10) continue;
     set(x, ground[x] - 1, M.Seed);
     for (let y = ground[x]; y < ground[x] + 5; y++) if (W.mat[y * w + x] === M.Dirt) W.flags[y * w + x] |= 2; // damp soil
+  }
+  return W;
+}
+
+/** A whole planet's circumference: continents, two oceans, a volcano, and a mountain range where the map wraps. */
+function planet(W: World) {
+  const w = W.w, h = W.h, r = () => W.rf();
+  const set = (x: number, y: number, m: number) => { if (W.inside(x, y)) W.spawn(y * w + x, m); };
+  const TAU = Math.PI * 2, ph = [r() * TAU, r() * TAU, r() * TAU];
+  const sea = Math.round(h * .36), ground: number[] = [];
+  for (let x = 0; x < w; x++) {
+    const u = x / w;
+    let g = h * .38 - Math.sin(u * TAU * 2 + ph[0]) * h * .1 - Math.sin(u * TAU * 5 + ph[1]) * h * .03 - Math.sin(u * TAU * 13 + ph[2]) * h * .012;
+    const e = Math.min(u, 1 - u) * w;                      // distance to the seam
+    if (e < 22) g -= (1 - e / 22) ** 1.5 * h * .24;       // the world-spine mountains hide the wrap
+    ground.push(Math.round(g));
+  }
+  const vx = Math.round(w * (.35 + r() * .3));
+  for (let x = 0; x < w; x++) {
+    const g = ground[x];
+    for (let y = g; y < h; y++) {
+      const depth = y - g;
+      if (y > h * .62 + Math.sin(x * TAU * 6 / w) * 3 || Math.min(x, w - 1 - x) < 22 && depth > 2) set(x, y, M.Stone);
+      else if (g > sea - 1 && depth < 4) set(x, y, M.Sand);
+      else set(x, y, M.Dirt);
+    }
+    for (let y = sea; y < g; y++) set(x, y, M.Water);
+  }
+  // a volcano: a stone cone over a lava chamber
+  const top = ground[vx] - 18;
+  for (let x = vx - 22; x <= vx + 22; x++) {
+    const peak = top + Math.abs(x - vx) * .8 + (Math.abs(x - vx) < 3 ? 3 : 0);
+    for (let y = Math.round(peak); y < ground[x] + 4; y++) set(x, y, M.Stone);
+  }
+  for (let y = top + 3; y < h * .72; y++) for (let x = vx - 1; x <= vx + 1; x++) set(x, y, M.Lava);
+  for (let y = Math.round(h * .64); y < h * .8; y++) for (let x = vx - 12; x <= vx + 12; x++) if ((x - vx) ** 2 / 144 + (y - h * .72) ** 2 / 36 < 1) set(x, y, M.Lava);
+  // seeds and bugs on dry land
+  for (let k = 0; k < 40; k++) {
+    const x = Math.round(r() * w), g = ground[x];
+    if (g >= sea - 1 || Math.abs(x - vx) < 26 || Math.min(x, w - 1 - x) < 24) continue;
+    set(x, g - 1, k % 5 ? M.Seed : M.Bug);
+    for (let y = g; y < g + 5; y++) if (W.mat[y * w + x] === M.Dirt) W.flags[y * w + x] |= 2;
   }
   return W;
 }

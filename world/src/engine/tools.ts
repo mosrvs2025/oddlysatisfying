@@ -2,7 +2,7 @@ import { World } from './world.ts';
 import { M, MATS, PHASE, Phase, CONDUCTIVE } from './materials.ts';
 
 /** Every way a player can touch the world. All of them go through the same deterministic RNG. */
-export type ToolId = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time';
+export type ToolId = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time' | 'storm';
 
 export function disc(world: World, cx: number, cy: number, r: number, f: (i: number, x: number, y: number, d: number) => void) {
   const R = Math.max(0, r), r2 = (R + .5) * (R + .5);
@@ -17,11 +17,29 @@ export function paint(world: World, x: number, y: number, r: number, m: number, 
   disc(world, x, y, r, (i) => {
     const t = world.mat[i];
     if (t === m) return;
-    if (t !== M.Empty && !overwrite) return;
-    if (MATS[t].indestructible && m !== M.Empty && !overwrite) return;
     if (sparse && r > 0 && world.rnd() % (m === M.Bug || m === M.Seed ? 9 : 3) !== 0) return;
+    if (t !== M.Empty && !overwrite) {
+      // painting into a liquid or gas pushes it out of the way instead of refusing
+      const pt = PHASE[t];
+      if (!(pt === Phase.Gas || (pt === Phase.Liquid && PHASE[m] !== Phase.Gas))) return;
+      if (pt === Phase.Liquid && !displace(world, i)) return;
+    }
+    if (MATS[t].indestructible && m !== M.Empty && !overwrite) return;
     world.spawn(i, m);
   });
+}
+/** Move the liquid at i up its column to the first free cell, so volume is kept. */
+function displace(world: World, i: number) {
+  const w = world.w;
+  for (let j = i - w, k = 0; j >= 0 && k < 60; j -= w, k++) {
+    const t = world.mat[j];
+    if (t === M.Empty || PHASE[t] === Phase.Gas) {
+      world.mat[j] = world.mat[i]; world.aux[j] = world.aux[i]; world.temp[j] = world.temp[i]; world.flags[j] = world.flags[i]; world.life[j] = world.life[i]; world.vel[j] = 0;
+      return true;
+    }
+    if (PHASE[t] !== Phase.Liquid) return false;
+  }
+  return false;
 }
 export function erase(world: World, x: number, y: number, r: number) {
   disc(world, x, y, r, (i) => { world.clear(i); world.charge[i] = 0; world.temp[i] = world.ambient[(i / world.w) | 0]; });
@@ -58,6 +76,17 @@ export function gravityWell(world: World, x: number, y: number, r: number) {
 export function timeWarp(world: World, x: number, y: number, r: number) {
   world.timeZones.push({ x: Math.round(x), y: Math.round(y), r: r * 2 + 6 });
 }
+/** Start a storm, or feed the nearest one so it grows. Small brushes make tornadoes, big ones hurricanes. */
+export function storm(world: World, x: number, y: number, r: number, spin = 1) {
+  const near = world.storms.find(s => Math.abs(s.x - x) < s.r * 2 && Math.abs(s.y - y) < s.r * 2);
+  if (near) { near.r = Math.min(40, near.r + .04 * (1 + r * .1)); near.life = Math.min(1200, near.life + 3); near.x += (x - near.x) * .05; near.y += (y - near.y) * .05; return; }
+  if (world.storms.length < 4) world.storms.push({ x, y, r: Math.max(4, r * 1.3), life: 360, spin });
+}
+/** Lightning queued by storms strikes the ground below. */
+export function flushStormBolts(world: World) {
+  for (const x of world.pendingBolts) lightning(world, x, world.h - 1);
+  world.pendingBolts.length = 0;
+}
 /** A jagged bolt from the sky to (x, y). Conductors along the way carry the charge on. */
 export function lightning(world: World, x: number, y: number) {
   const pts: number[] = [];
@@ -82,7 +111,7 @@ export function lightning(world: World, x: number, y: number) {
     world.temp[i] += 2600 * (1 - d / 4);
     const m = world.mat[i];
     if (m === M.Sand && d < 3) { world.become(i, M.Glass); world.find('fulgurite'); }
-    if (CONDUCTIVE[m] > 0) world.charge[i] = 1;
+    if (CONDUCTIVE[m] > 0) { world.charge[i] = 1; world.eLive = true; }
   });
   world.explode(hx, hy, 3, 300);
 }

@@ -78,3 +78,15 @@ test('a full-size world steps in budget', () => {
   const ms = (performance.now() - t0) / 120;
   assert.ok(ms < 12, `${ms.toFixed(2)} ms per step`);
 });
+test('oil painted into the bottom of a pond displaces the water and floats to the top', () => {
+  const w = new World(30, 40, 7);
+  for (let y = 10; y < 40; y++) for (let x = 0; x < 30; x++) w.spawn(y * 30 + x, M.Water);
+  const water0 = w.count(M.Water);
+  for (let k = 0; k < 12; k++) paint(w, 15, 36, 3, M.Oil);
+  const oil = w.count(M.Oil);
+  assert.ok(oil > 10, `only ${oil} oil placed`);
+  assert.equal(w.count(M.Water), water0, 'water was destroyed instead of displaced');
+  for (let t = 0; t < 900; t++) w.step();
+  let deepOil = 0; for (let y = 25; y < 40; y++) for (let x = 0; x < 30; x++) if (w.mat[y * 30 + x] === M.Oil) deepOil++;
+  assert.ok(deepOil <= 1, `${deepOil} oil cells still deep underwater`);
+});

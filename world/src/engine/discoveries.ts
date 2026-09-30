@@ -85,6 +85,9 @@ export const DISCOVERIES: Discovery[] = [
   // weather & forces
   { id: 'wind-blown', group: 'Weather', name: 'Drift', text: 'Wind carries light powders like ash, snow and seeds.' },
   { id: 'waves', group: 'Weather', name: 'Waves', text: 'Wind pushes water around.' },
+  { id: 'tornado', group: 'Weather', name: 'Tornado', text: 'A spinning storm lifts sand, soil, bugs and plants into its funnel.' },
+  { id: 'waterspout', group: 'Weather', name: 'Waterspout', text: 'A tornado over water sucks the water up with it.' },
+  { id: 'hurricane', group: 'Weather', name: 'Hurricane', text: 'Feed a storm until it is huge and it wrings rain and lightning out of its eyewall.' },
   { id: 'shockwave', group: 'Weather', name: 'Shockwave', text: 'Explosions push the air, and the air pushes everything else.' },
 ];
 

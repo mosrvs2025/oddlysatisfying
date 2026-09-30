@@ -1,6 +1,6 @@
 import { World, F } from '../src/engine/world.ts';
 import { M } from '../src/engine/materials.ts';
-import { lightning, bomb, wind } from '../src/engine/tools.ts';
+import { lightning, bomb, wind, storm } from '../src/engine/tools.ts';
 
 // One small, hand-built world per discovery. Each proves the reaction emerges from the rules:
 // nothing here calls world.find() directly.
@@ -87,6 +87,9 @@ export const SCENARIOS: Scenario[] = [
   { id: 'fungus-light', ticks: 1500, setup: w => { floor(w); rect(w, 10, 28, 20, 28, M.Fungus); } },
   { id: 'swamp-gas', ticks: 2000, setup: w => { floor(w); rect(w, 0, 5, 29, 5, M.Stone); rect(w, 5, 26, 25, 28, M.Fungus); } },
   { id: 'wind-blown', ticks: 60, setup: w => { floor(w); rect(w, 5, 26, 25, 28, M.Ash); }, each: w => wind(w, 10, 26, 6, 1.2, -.4) },
+  { id: 'tornado', ticks: 120, setup: w => { floor(w); rect(w, 3, 25, 27, 28, M.Sand); storm(w, 15, 14, 6); } },
+  { id: 'waterspout', ticks: 120, setup: w => { floor(w); rect(w, 3, 25, 27, 28, M.Water); storm(w, 15, 14, 6); } },
+  { id: 'hurricane', size: [80, 60], ticks: 60, setup: w => { floor(w); storm(w, 40, 20, 14); } },
   { id: 'waves', ticks: 60, setup: w => { floor(w); rect(w, 3, 24, 27, 28, M.Water); }, each: w => wind(w, 10, 23, 6, 1.5, 0) },
 ];
 
