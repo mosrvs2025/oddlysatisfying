@@ -5,6 +5,7 @@ import { paint, erase, heat, wind, rain, bomb, gravityWell, timeWarp, lightning,
 import { snapshot, restore, toCode, fromCode, type Snapshot } from './engine/serialize.ts';
 import { Renderer, type Camera, type ViewMode } from './render/renderer.ts';
 import { makeScene, sizeFor, type SceneId } from './scenes.ts';
+import { pickGlobe } from './render/globe.ts';
 import { CSS } from './styles.ts';
 import { Sound } from './sound.ts';
 
@@ -82,6 +83,9 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   const cam: Camera = { zoom: 1, x: 0, y: 0 };
   // globe view: zoom 1 shows the whole planet; rot is in turns
   const globe = { on: false, zoom: 1, rot: 0 };
+  // 3D globe: yaw/tilt in radians, zoom scales the sphere
+  const sph = { on: false, zoom: 1, yaw: 0, tilt: .35, idle: 0 };
+  function sphGeom() { const cw = canvas.clientWidth, ch = canvas.clientHeight; return { cx: cw / 2, cy: (ch - 110) / 2, r: Math.min(cw, ch - 150) * .42 * sph.zoom }; }
   function globeGeom() {
     const cw = canvas.clientWidth, ch = canvas.clientHeight;
     const base = Math.min(cw, ch - 150) * .6, rOut = base * globe.zoom;
@@ -92,11 +96,17 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const rIn = rOut * k, rs = rOut - surf * (rOut - rIn);
     return { cx: cw / 2, cy: (ch - 110) / 2 + rs * (1 - 1 / globe.zoom), rOut, rIn, rs };
   }
-  function setGlobe(on: boolean) {
-    globe.on = on; store.set('globe', on);
-    $('[data-a=globe]').classList.toggle('on', on);
-    if (on) showTip('Globe view. Drag with two fingers or right-drag to spin it, pinch to fly down to the surface');
+  /** View cycle: 0 flat, 1 ring (the world wrapped into a planet slice), 2 spinning 3D globe. */
+  function setView3(v: number) {
+    globe.on = v === 1; sph.on = v === 2; store.set('view3', v);
+    $('[data-a=globe]').classList.toggle('on', v > 0);
+    $('[data-a=globe]').setAttribute('aria-label', ['Globe view', '3D globe', 'Flat view'][v]);
+    paintHeld = null;
+    if (v === 1) showTip('Planet slice. Two-finger drag or right-drag spins it, pinch flies down to the surface. Tap the globe button again for 3D');
+    if (v === 2) showTip('3D globe, drawn live from your world. Drag to spin, pinch to zoom, tap the planet to use your tool there');
   }
+  const view3 = () => sph.on ? 2 : globe.on ? 1 : 0;
+  function setGlobe(on: boolean) { setView3(on ? 1 : 0); }
   const undo: Snapshot[] = [], redo: Snapshot[] = [];
   let seed = (Math.random() * 2 ** 31) | 0;
 
@@ -108,7 +118,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   let minZoom = 1;
   function newWorld(id: SceneId) {
     const { w, h } = id === 'planet' ? { w: 500, h: 132 } : sizeFor(canvas.clientWidth / Math.max(1, canvas.clientHeight));
-    if (id === 'planet' && !globe.on) setGlobe(true);
+    if (id === 'planet' && view3() === 0) setView3(2);
     seed = (seed * 1103515245 + 12345) >>> 0;
     setWorld(makeScene(id, w, h, seed));
     undo.length = 0; redo.length = 0;
@@ -236,7 +246,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     else if (a === 'shut') sheet.hidden = true;
     else if (a === 'undo') doUndo();
     else if (a === 'redo') doRedo();
-    else if (a === 'globe') setGlobe(!globe.on);
+    else if (a === 'globe') setView3((view3() + 1) % 3);
     else if (a === 'pause') { paused = !paused; updateTop(); }
     else if (a === 'speed') { speed = speed === 1 ? 2 : speed === 2 ? 4 : speed === 4 ? .5 : 1; updateTop(); }
   });
@@ -248,6 +258,19 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   let paintHeld: { x: number; y: number; px: number; py: number; vx: number; vy: number; fresh: boolean; hold: number } | null = null;
   let pinch: { d: number; cx: number; cy: number; zoom: number; wx: number; wy: number } | null = null;
   let panning: { x: number; y: number } | null = null, spaceDown = false, hover = { x: -1, y: -1, in: false };
+  let sphTap: { x: number; y: number; t: number } | null = null, burst = 0;
+  /** A tap on the 3D globe uses the current tool at that spot's surface, for a short burst. */
+  function tapSphere(sx: number, sy: number) {
+    const r = canvas.getBoundingClientRect(), g = sphGeom();
+    const hit = pickGlobe(sx - r.left, sy - r.top, g.cx, g.cy, g.r, sph.yaw, sph.tilt);
+    if (!hit) return;
+    const x = Math.min(world.w - 1, Math.floor(hit.lon * world.w));
+    let y = 0; while (y < world.h - 1 && (world.mat[y * world.w + x] === M.Empty || PHASE[world.mat[y * world.w + x]] === Phase.Gas)) y++;
+    const ty = tool === 'storm' || tool === 'rain' ? Math.max(4, y - 30) : Math.max(0, y - brush - 2);
+    pushUndo();
+    paintHeld = { x, y: ty, px: x, py: ty, vx: 0, vy: 0, fresh: true, hold: 0 };
+    burst = tool === 'storm' ? 90 : 24;
+  }
   const toWorld = (sx: number, sy: number) => {
     const r = canvas.getBoundingClientRect();
     if (globe.on) {
@@ -282,9 +305,11 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
       if (paintHeld && paintHeld.hold < 8) doUndo();
       paintHeld = null;
       const [a, b] = [...ptrs.values()], cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2, w = toWorld(cx, cy);
-      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), cx, cy, zoom: globe.on ? globe.zoom : cam.zoom, wx: w.x, wy: w.y };
+      panning = null; sphTap = null;
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), cx, cy, zoom: sph.on ? sph.zoom : globe.on ? globe.zoom : cam.zoom, wx: w.x, wy: w.y };
       return;
     }
+    if (ptrs.size === 1 && sph.on) { panning = { x: e.clientX, y: e.clientY }; sphTap = { x: e.clientX, y: e.clientY, t: performance.now() }; return; }
     if (ptrs.size === 1) startStroke(e.clientX, e.clientY);
   });
   canvas.addEventListener('pointermove', e => {
@@ -292,6 +317,19 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const w = toWorld(e.clientX, e.clientY); hover = { x: w.x, y: w.y, in: true };
     if (!p) return;
     p.x = e.clientX; p.y = e.clientY;
+    if (sph.on) {
+      sph.idle = 0;
+      if (panning) {
+        const R = sphGeom().r;
+        sph.yaw += (e.clientX - panning.x) / R; sph.tilt = Math.max(-1.3, Math.min(1.3, sph.tilt + (e.clientY - panning.y) / R));
+        panning = { x: e.clientX, y: e.clientY };
+        if (sphTap && Math.hypot(e.clientX - sphTap.x, e.clientY - sphTap.y) > 8) sphTap = null;
+      } else if (pinch && ptrs.size >= 2) {
+        const [a, b] = [...ptrs.values()];
+        sph.zoom = Math.max(.6, Math.min(3, pinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / Math.max(1, pinch.d)));
+      }
+      return;
+    }
     if (panning && globe.on) { globe.rot -= (e.clientX - panning.x) / (2 * Math.PI * globeGeom().rs); panning = { x: e.clientX, y: e.clientY }; return; }
     if (panning) { cam.x -= (e.clientX - panning.x) / cam.zoom; cam.y -= (e.clientY - panning.y) / cam.zoom; panning = { x: e.clientX, y: e.clientY }; clampCam(); return; }
     if (pinch && ptrs.size >= 2 && globe.on) {
@@ -310,9 +348,11 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     if (paintHeld) { paintHeld.x = w.x; paintHeld.y = w.y; }
   });
   const up = (e: PointerEvent) => {
+    if (sph.on && sphTap && ptrs.size === 1 && performance.now() - sphTap.t < 400) tapSphere(sphTap.x, sphTap.y);
+    sphTap = null;
     ptrs.delete(e.pointerId);
     if (ptrs.size < 2) pinch = null;
-    if (!ptrs.size) { panning = null; paintHeld = null; }
+    if (!ptrs.size) { panning = null; if (!burst) paintHeld = null; }
   };
   canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
   canvas.addEventListener('pointerleave', () => { hover.in = false; });
@@ -321,6 +361,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     e.preventDefault();
     if (e.altKey || e.shiftKey) { setBrush(brush + (e.deltaY > 0 ? -1 : 1)); return; }
     const f = Math.exp(-e.deltaY * (e.deltaMode ? .05 : .0015));
+    if (sph.on) { sph.zoom = Math.max(.6, Math.min(3, sph.zoom * f)); return; }
     if (globe.on) { globe.zoom = Math.max(1, Math.min(8, globe.zoom * f)); return; }
     zoomAt(e.clientX, e.clientY, cam.zoom * f);
   }, { passive: false });
@@ -334,7 +375,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     else if (e.key === '[') setBrush(brush - 1);
     else if (e.key === ']') setBrush(brush + 1);
     else if (e.key === 'p' || e.key === 'P') { paused = !paused; updateTop(); }
-    else if (e.key === 'g' || e.key === 'G') setGlobe(!globe.on);
+    else if (e.key === 'g' || e.key === 'G') setView3((view3() + 1) % 3);
     else if (e.key === 'Escape') { if (!sheet.hidden) sheet.hidden = true; else opts.onClose?.(); }
     else { const k = '1234567890'.indexOf(e.key); if (k >= 0 && TOOLS[k] && toolUnlocked(TOOLS[k].id)) { tool = TOOLS[k].id; buildTools(); buildMats(); } }
     e.stopPropagation();
@@ -363,6 +404,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
       case 'bomb': if (p.fresh) bomb(world, p.x, p.y, r); break;
     }
     p.px = p.x; p.py = p.y; p.fresh = false; p.hold++;
+    if (burst > 0 && --burst === 0) paintHeld = null;
   }
 
   // ---------------- loop ----------------
@@ -389,6 +431,11 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
     const t1 = performance.now();
     const showBrush = paintHeld || hover.in;
     R.brush = { x: paintHeld ? paintHeld.x : hover.x, y: paintHeld ? paintHeld.y : hover.y, r: brush + .5, on: showBrush && !pinch ? (paintHeld ? .5 : 1) : 0 };
+    if (sph.on) {
+      const g = sphGeom();
+      if (!ptrs.size && ++sph.idle > 120) sph.yaw += .0025; // drifts slowly when left alone
+      R.sphere = { on: true, cx: g.cx, cy: g.cy, r: g.r, yaw: sph.yaw, tilt: sph.tilt };
+    } else R.sphere.on = false;
     if (globe.on) { const g = globeGeom(); R.planet = { on: true, cx: g.cx, cy: g.cy, rOut: g.rOut, rIn: g.rIn, rot: globe.rot }; }
     else R.planet.on = false;
     R.render(cam, now / 1000);
@@ -402,7 +449,7 @@ export function mount(host: HTMLElement, opts: MountOptions = {}) {
   // ---------------- start ----------------
   canvas.width = Math.round(canvas.clientWidth * dpr()); canvas.height = Math.round(canvas.clientHeight * dpr());
   newWorld('valley');
-  if (store.get('globe', false)) setGlobe(true);
+  setView3(store.get('view3', 0));
   for (let k = 0; k < 30; k++) world.step(); // settle the scene before the first frame
   world.newFinds.length = 0;
   debugEl.hidden = !debug;

@@ -1,6 +1,7 @@
 import type { World } from '../engine/world.ts';
 
 import { MATS, MAT_COUNT } from '../engine/materials.ts';
+import { GLOBE_FS, buildColumns } from './globe.ts';
 
 export type ViewMode = 'normal' | 'heat' | 'air' | 'charge';
 export interface Camera { zoom: number; x: number; y: number } // x, y: world cell at the screen centre
@@ -188,6 +189,10 @@ export class Renderer {
   brush = { x: 0, y: 0, r: 0, on: 0 };
   /** Globe view geometry in CSS pixels; rot is in turns. */
   planet = { on: false, cx: 0, cy: 0, rOut: 1, rIn: 0, rot: 0 };
+  /** 3D globe view (CSS px); yaw and tilt in radians. */
+  sphere = { on: false, cx: 0, cy: 0, r: 1, yaw: 0, tilt: .35 };
+  private colTex: WebGLTexture | null = null; private colTex2: WebGLTexture | null = null;
+  private cols = new Uint8Array(0); private cols2 = new Uint8Array(0); private colFrame = 0;
   ambient = .82;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -200,7 +205,7 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     this.quad = q;
-    this.prog.world = this.link(VS, WORLD_FS); this.prog.down = this.link(VS, DOWN_FS); this.prog.blur = this.link(VS, BLUR_FS); this.prog.comp = this.link(VS, COMP_FS);
+    this.prog.world = this.link(VS, WORLD_FS); this.prog.down = this.link(VS, DOWN_FS); this.prog.blur = this.link(VS, BLUR_FS); this.prog.comp = this.link(VS, COMP_FS); this.prog.globe = this.link(VS, GLOBE_FS);
     this.prog.pts = this.link(PT_VS, PT_FS, { aPos: 0, aCol: 1 });
     this.ptVao = gl.createVertexArray()!; gl.bindVertexArray(this.ptVao);
     this.ptBuf = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, this.ptBuf);
@@ -305,8 +310,34 @@ export class Renderer {
   }
 
   private time = 0;
+  private renderSphere(time: number) {
+    const gl = this.gl, W = this.world;
+    if (this.cols.length !== W.w * 4) {
+      this.cols = new Uint8Array(W.w * 4); this.cols2 = new Uint8Array(W.w * 4);
+      this.colTex = this.tex(W.w, 1, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR); this.colTex2 = this.tex(W.w, 1, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+      this.colFrame = 0;
+    }
+    if (this.colFrame++ % 3 === 0) {
+      buildColumns(W, this.cols, this.cols2);
+      for (const [t, d] of [[this.colTex!, this.cols], [this.colTex2!, this.cols2]] as const) {
+        gl.bindTexture(gl.TEXTURE_2D, t); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W.w, 1, gl.RGBA, gl.UNSIGNED_BYTE, d);
+      }
+    }
+    const u = this.use('globe'), S = this.sphere, dpr = this.canvas.width / Math.max(1, this.canvas.clientWidth);
+    this.bind(null); gl.disable(gl.BLEND);
+    this.texUnit(u.uCols, 0, this.colTex!); this.texUnit(u.uCols2, 1, this.colTex2!);
+    gl.uniform2f(u.uScreen, this.canvas.width, this.canvas.height);
+    gl.uniform3f(u.uCenter, S.cx * dpr, S.cy * dpr, S.r * dpr);
+    gl.uniform1f(u.uYaw, S.yaw); gl.uniform1f(u.uTilt, S.tilt); gl.uniform1f(u.uTime, time);
+    const sd = new Float32Array(16); let ns = 0;
+    for (const s of W.storms) { if (ns >= 4) break; sd.set([s.x / W.w, Math.min(.5, .05 + s.r / W.w * 5), s.spin, Math.min(1, s.life / 120)], ns * 4); ns++; }
+    gl.uniform4fv(u.uStorm, sd); gl.uniform1i(u.uStorms, ns);
+    this.draw();
+  }
   render(cam: Camera, time: number) {
     this.time = time;
+    if (this.sphere.on) { this.world.sparks.length = 0; this.renderSphere(time); return; }
     const gl = this.gl, W = this.world;
     this.upload();
     this.spawnEmbers(time);
