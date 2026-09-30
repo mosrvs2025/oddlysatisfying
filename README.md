@@ -23,4 +23,6 @@ Keys 1–8 switch tabs.
 - `scripts/build.sh` wraps it into a standalone `_site/index.html`.
 - `.github/workflows/pages.yml` builds and deploys to GitHub Pages on every push to `main`.
 
+Vercel uses `vercel.json`, which runs the same build and serves `_site/`.
+
 To run locally: `./scripts/build.sh` then open `_site/index.html`.

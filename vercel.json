@@ -1,0 +1,6 @@
+{
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "sh scripts/build.sh",
+  "outputDirectory": "_site"
+}
