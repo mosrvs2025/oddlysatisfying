@@ -16,7 +16,7 @@ function set(w: World, x: number, y: number, m: number, t?: number) { w.spawn(y 
 export const SCENARIOS: Scenario[] = [
   { id: 'boil', ticks: 60, setup: w => { floor(w); rect(w, 10, 25, 20, 28, M.Water, 150); } },
   { id: 'condense', ticks: 400, setup: w => { rect(w, 10, 20, 20, 22, M.Steam, 70); } },
-  { id: 'freeze', ticks: 200, setup: w => { floor(w); rect(w, 10, 26, 20, 28, M.Water, -3); set(w, 15, 25, M.Ice); } },
+  { id: 'freeze', ticks: 200, setup: w => { floor(w); rect(w, 9, 24, 9, 28, M.Wall); rect(w, 21, 24, 21, 28, M.Wall); rect(w, 10, 26, 20, 28, M.Water, -6); set(w, 15, 25, M.Ice); } },
   { id: 'melt', ticks: 60, setup: w => { floor(w); rect(w, 10, 26, 20, 28, M.Ice, 30); } },
   { id: 'snowfall', ticks: 200, setup: w => { rect(w, 10, 3, 20, 4, M.Steam, -5); } },
   { id: 'snow-melt', ticks: 200, setup: w => { floor(w); rect(w, 10, 26, 20, 28, M.Snow, 30); } },
@@ -90,6 +90,15 @@ export const SCENARIOS: Scenario[] = [
   { id: 'tornado', ticks: 120, setup: w => { floor(w); rect(w, 3, 25, 27, 28, M.Sand); storm(w, 15, 14, 6); } },
   { id: 'waterspout', ticks: 120, setup: w => { floor(w); rect(w, 3, 25, 27, 28, M.Water); storm(w, 15, 14, 6); } },
   { id: 'hurricane', size: [80, 60], ticks: 60, setup: w => { floor(w); storm(w, 40, 20, 14); } },
+  { id: 'algae-appears', ticks: 3000, setup: w => { floor(w); rect(w, 0, 26, 29, 28, M.Dirt); for (let x = 0; x < 30; x++) for (let y = 26; y < 29; y++) w.flags[y * 30 + x] |= F.FERT; rect(w, 0, 22, 29, 25, M.Water); } },
+  { id: 'algae-bloom', ticks: 600, setup: w => { floor(w); rect(w, 0, 20, 29, 28, M.Water); set(w, 15, 22, M.Algae); } },
+  { id: 'algae-dries', ticks: 1200, setup: w => { floor(w); rect(w, 10, 28, 20, 28, M.Algae); } },
+  { id: 'fish-eats', ticks: 600, setup: w => { floor(w); rect(w, 0, 20, 29, 28, M.Water); set(w, 15, 24, M.Fish); rect(w, 13, 22, 17, 26, M.Algae); set(w, 15, 24, M.Fish); } },
+  { id: 'fish-breeds', ticks: 3000, setup: w => { floor(w); rect(w, 0, 18, 29, 28, M.Water); rect(w, 0, 18, 29, 28, M.Algae); for (let y = 18; y < 29; y += 2) for (let x = 0; x < 30; x += 2) set(w, x, y, M.Water); set(w, 15, 24, M.Fish); } },
+  { id: 'food-chain', ticks: 600, setup: w => { floor(w); rect(w, 5, 24, 25, 28, M.Water); set(w, 15, 27, M.Fish); set(w, 14, 26, M.Bug); set(w, 16, 26, M.Bug); set(w, 15, 25, M.Bug); } },
+  { id: 'fish-suffocate', ticks: 600, setup: w => { floor(w); set(w, 15, 27, M.Fish); } },
+  { id: 'fish-cooked', ticks: 60, setup: w => { floor(w); rect(w, 5, 24, 25, 28, M.Water, 80); set(w, 15, 26, M.Fish); } },
+  { id: 'fish-starve', ticks: 4000, setup: w => { floor(w); rect(w, 5, 20, 25, 28, M.Water); set(w, 15, 26, M.Fish); } },
   { id: 'waves', ticks: 60, setup: w => { floor(w); rect(w, 3, 24, 27, 28, M.Water); }, each: w => wind(w, 10, 23, 6, 1.5, 0) },
 ];
 

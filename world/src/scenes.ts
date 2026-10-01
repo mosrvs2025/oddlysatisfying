@@ -48,6 +48,9 @@ export function makeScene(id: SceneId, w: number, h: number, seed: number): Worl
   const b0 = Math.max(0, Math.round(pond - w * .14)), b1 = Math.min(w - 1, Math.round(pond + w * .14));
   const lip = Math.max(ground[b0], ground[b1]) + 2;
   for (let x = b0; x <= b1; x++) for (let y = lip; y < ground[x]; y++) set(x, y, M.Water);
+  // a few fish and a little algae in the pond
+  for (let k = 0; k < 5; k++) { const x = Math.round(pond + (r() - .5) * w * .12), y = Math.round(lip + 3 + r() * Math.max(1, ground[x] - lip - 5)); if (W.mat[y * w + x] === M.Water) set(x, y, M.Fish); }
+  for (let k = 0; k < 6; k++) { const x = Math.round(pond + (r() - .5) * w * .2), y = ground[Math.max(0, Math.min(w - 1, x))] - 1; if (W.inside(x, y) && W.mat[y * w + x] === M.Water) set(x, y, M.Algae); }
   // a lava pocket under the rock, sealed by stone
   const lx = Math.round(w * (r() < .5 ? .15 : .8));
   const ly = rock(lx) + 8;
@@ -91,6 +94,8 @@ function planet(W: World) {
     }
     for (let y = sea; y < g; y++) set(x, y, M.Water);
   }
+  // fish and algae in the oceans
+  for (let k = 0; k < 60; k++) { const x = Math.round(r() * (w - 1)), y = Math.round(sea + 2 + r() * (h * .2)); if (W.mat[y * w + x] === M.Water) set(x, y, k % 3 ? M.Algae : M.Fish); }
   // a volcano: a stone cone over a lava chamber
   const top = ground[vx] - 18;
   for (let x = vx - 22; x <= vx + 22; x++) {

@@ -77,6 +77,7 @@ export class World {
       case M.Fire: return 18 + (this.rnd() % 26);
       case M.Smoke: return 60 + (this.rnd() % 140);
       case M.Bug: return 220;
+      case M.Fish: return 230;
       case M.Plant: return 0;
       default: return 0;
     }
@@ -148,6 +149,8 @@ export class World {
       case M.Plant: this.plant(i, x, y); return;
       case M.Fungus: if (this.fungus(i, x, y)) return; break;
       case M.Bug: this.bug(i, x, y); return;
+      case M.Fish: this.fish(i, x, y); return;
+      case M.Algae: this.algae(i, x, y); return;
       case M.Metal: this.metal(i, x, y); break;
     }
     if (this.mat[i] !== m) return;
@@ -416,6 +419,11 @@ export class World {
   }
   water(i: number, x: number, y: number): boolean {
     if (this.charge[i] === 1 && this.one(30)) { this.become(i, M.Hydrogen); this.find('electrolysis'); return true; }
+    // life starts on its own: sunlit water touching rich soil grows algae
+    if (this.one(300)) {
+      const n = this.randNeighbor(x, y);
+      if (n >= 0 && this.mat[n] === M.Dirt && (this.flags[n] & F.FERT) && this.lit(i)) { this.become(i, M.Algae); this.find('algae-appears'); return true; }
+    }
     return false;
   }
   brine(i: number, x: number, y: number) { /* reactions live on the other side (salt, metal, plant) */ }
@@ -592,6 +600,66 @@ export class World {
     if (y > 0 && this.mat[f - w] === M.Empty && this.mat[i - w] === M.Empty) { this.swap(i, f - w); return; }
     this.flags[i] ^= F.DIR;
   }
+  /** Algae: lives only in water, spreads through sunlit water, faster near rich soil or ash. */
+  algae(i: number, x: number, y: number) {
+    const T = this.temp[i];
+    if (T > 70) { this.become(i, M.Water); return; }
+    if (!this.one(4)) return;
+    let wet = 0, rich = 0;
+    for (let k = 0; k < 4; k++) {
+      const nx = x + N4X[k], ny = y + N4Y[k]; if (nx < 0 || ny < 0 || nx >= this.w || ny >= this.h) continue;
+      const t = this.mat[ny * this.w + nx];
+      if (t === M.Water) wet++;
+      else if ((t === M.Dirt && (this.flags[ny * this.w + nx] & F.FERT)) || t === M.Ash) rich++;
+    }
+    const sub = y > 0 && (this.mat[i - this.w] === M.Water || this.mat[i - this.w] === M.Algae);
+    if (!wet && !sub) { if (this.one(30)) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('algae-dries'); } return; }
+    const n = this.randNeighbor(x, y);
+    if (n >= 0 && this.mat[n] === M.Water && this.lit(n) && this.one(rich ? 6 : 40)) { this.become(n, M.Algae); this.find('algae-bloom'); return; }
+    // drift in the water
+    if (n >= 0 && this.mat[n] === M.Water && this.one(3)) this.swap(i, n);
+  }
+  /** Fish: swim through water, eat algae and whatever falls in, breed when fed, suffocate in air. */
+  fish(i: number, x: number, y: number) {
+    const w = this.w, h = this.h, T = this.temp[i];
+    if (T > 45 && !(this.flags[i] & F.BURN)) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-cooked'); return; }
+    if (this.combust(i, x, y, M.Fish)) return;
+    if (!this.one(2)) return;
+    let wet = 0;
+    for (let k = 0; k < 8; k++) {
+      const nx = x + N8X[k], ny = y + N8Y[k]; if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const t = this.mat[ny * w + nx]; if (t === M.Water || t === M.SaltWater || t === M.Algae) wet++;
+    }
+    if (!wet) {
+      // out of water: flop, fall, gasp
+      if (y + 1 < h && (this.mat[i + w] === M.Empty || PHASE[this.mat[i + w]] === Phase.Gas)) { this.swap(i, i + w); return; }
+      if (this.life[i] > 6) this.life[i] -= 6; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-suffocate'); }
+      if (this.one(3)) { const f = i + ((this.rnd() & 1) ? 1 : -1); const fx = f % w; if (Math.abs(fx - x) === 1 && this.mat[f] === M.Water) this.swap(i, f); }
+      return;
+    }
+    if (this.one(4)) { if (this.life[i] > 0) this.life[i]--; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-starve'); return; } }
+    // eat
+    const n = this.randNeighbor(x, y);
+    if (n >= 0) {
+      const t = this.mat[n];
+      if (t === M.Algae || t === M.Bug || t === M.Seed || t === M.Plant) {
+        this.become(n, M.Water); this.life[i] = 255; this.vel[i]++;
+        this.find(t === M.Bug ? 'food-chain' : 'fish-eats');
+        if (this.vel[i] >= 4) {
+          const k = this.randNeighbor(x, y);
+          if (k >= 0 && this.mat[k] === M.Water) { this.spawn(k, M.Fish); this.life[k] = 180; this.vel[i] = 0; this.find('fish-breeds'); }
+        }
+        return;
+      }
+    }
+    // swim: keep heading one way, wander up and down, turn at walls
+    const dir = (this.flags[i] & F.DIR) ? 1 : -1, dy = (this.rnd() % 3) - 1;
+    const nx = x + dir, ny = y + dy;
+    if (nx < 0 || nx >= w || ny < 0 || ny >= h) { this.flags[i] ^= F.DIR; return; }
+    const j = ny * w + nx, t = this.mat[j];
+    if (t === M.Water || t === M.SaltWater) { const f = this.flags[i]; this.swap(i, j); this.flags[j] = f; return; }
+    if (this.one(2)) this.flags[i] ^= F.DIR;
+  }
   metal(i: number, x: number, y: number) {
     if (this.temp[i] > 600) this.find('red-hot');
     if (!this.one(16)) return;
@@ -701,7 +769,7 @@ export class World {
       for (let k = 0; k < 4; k++) {
         const nx = x + N4X[k], ny = y + N4Y[k]; if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
         const j = ny * w + nx, t = mat[j];
-        if (t === M.Bug) { this.become(j, M.Ash); this.find('electrocute'); }
+        if (t === M.Bug || t === M.Fish) { this.become(j, M.Ash); this.find('electrocute'); }
         else if (IGNITE[t] < 1e8 && (PHASE[t] === Phase.Gas || t === M.Gunpowder || t === M.Oil)) { this.temp[j] += 600; this.find('spark-ignite'); }
       }
     }

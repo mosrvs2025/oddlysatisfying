@@ -8,9 +8,9 @@ export const M = {
   Empty: 0, Wall: 1, Stone: 2, Sand: 3, Dirt: 4, Water: 5, SaltWater: 6, Salt: 7, Ice: 8, Snow: 9,
   Steam: 10, Oil: 11, Lava: 12, Obsidian: 13, Acid: 14, Wood: 15, Plant: 16, Seed: 17, Fungus: 18,
   Bug: 19, Fire: 20, Smoke: 21, Metal: 22, Rust: 23, Gunpowder: 24, Methane: 25, Battery: 26,
-  Ash: 27, Glass: 28, Hydrogen: 29,
+  Ash: 27, Glass: 28, Hydrogen: 29, Fish: 30, Algae: 31,
 } as const;
-export const MAT_COUNT = 30;
+export const MAT_COUNT = 32;
 
 export interface MaterialDef {
   id: number;
@@ -61,6 +61,8 @@ def({ id: M.Plant, name: 'Plant', phase: Phase.Life, color: [60, 170, 70], varia
 def({ id: M.Seed, name: 'Seed', phase: Phase.Powder, color: [196, 160, 80], variance: .12, density: 7, conduct: .15, capacity: 1.5, ignite: 160, fuel: 6, burnTemp: 500, burnTo: M.Ash, blowable: .35, starter: true, blurb: 'Floats on water. Sprouts on wet soil.' });
 def({ id: M.Fungus, name: 'Fungus', phase: Phase.Life, color: [196, 150, 190], variance: .2, density: 7, conduct: .1, capacity: 2, ignite: 210, fuel: 25, burnTemp: 500, burnTo: M.Ash, blurb: 'Spreads in damp darkness and digests wood.' });
 def({ id: M.Bug, name: 'Bugs', phase: Phase.Life, color: [230, 60, 60], variance: .2, density: 11, conduct: .2, capacity: 1.5, ignite: 120, fuel: 4, burnTemp: 400, burnTo: M.Ash, starter: true, blurb: 'Walk, climb, eat plants, breed when fed, starve into soil.' });
+def({ id: M.Fish, name: 'Fish', phase: Phase.Life, color: [250, 150, 60], variance: .25, density: 10, conduct: .2, capacity: 3, ignite: 200, fuel: 4, burnTemp: 400, burnTo: M.Ash, starter: true, blurb: 'Swim, eat algae and anything that falls in, breed when fed. Need water to breathe.' });
+def({ id: M.Algae, name: 'Algae', phase: Phase.Life, color: [70, 150, 90], variance: .25, density: 10, conduct: .3, capacity: 3, blurb: 'Grows through sunlit water, faster where soil is rich. Dries out of water.' });
 def({ id: M.Fire, name: 'Fire', phase: Phase.Gas, color: [255, 150, 40], variance: .3, density: .3, conduct: .6, capacity: 1, startTemp: 900, emissive: 1, blurb: 'Hot rising flame. Needs fuel to keep going.' });
 def({ id: M.Smoke, name: 'Smoke', phase: Phase.Gas, color: [70, 70, 76], variance: .2, density: .7, conduct: .05, capacity: 1, blurb: 'Drifts on the wind and fades.' });
 def({ id: M.Metal, name: 'Metal', phase: Phase.Static, color: [150, 160, 176], variance: .06, density: 40, conduct: 1, capacity: 1.2, hot: 1500, hotTo: M.Lava, conductive: 1, starter: true, blurb: 'Conducts heat and electricity. Rusts when wet.' });
