@@ -891,56 +891,187 @@ const Sand = (() => {
 
 /* ================= SLIME: pressurised soft bodies ================= */
 const Slime = (() => {
-  const blobs = []; let grav = true, grab = null, poke = null, floorY = 600, hueSeed = Math.random();
-  const G = 1400, KS = 2400, KB = 700, CS = 16, KP = 560;
-  function makeBlob(cx, cy, r, h) {
-    const N = Math.round(clamp(r / 2.2, 28, 44));
-    const b = { N, r, h, x: new Float32Array(N), y: new Float32Array(N), vx: new Float32Array(N), vy: new Float32Array(N), fx: new Float32Array(N), fy: new Float32Array(N), last: 0 };
+  // Soft bodies: a ring of point masses joined by edge + bend springs, inflated by gas pressure (P = k·A0/A).
+  // Every material is just a different parameter set; merging, tearing, sticking and bursting fall out of the numbers.
+  const MATS = {
+    jelly:  { name: 'Jelly',  ks: 2400, kb: 700,  kp: 560, cs: 16, drag: .9993, bounce: .15, fric: .9,  stick: 0, tear: 2.15, merge: true,  burst: 9,    tough: 520,  hue: null },
+    honey:  { name: 'Honey',  ks: 1300, kb: 160,  kp: 330, cs: 55, drag: .9996, bounce: .02, fric: .6,  stick: 1, tear: 2.3,  merge: true,  burst: 9,    tough: 700,  hue: .1 },
+    rubber: { name: 'Rubber', ks: 16000, kb: 7000, kp: 3000, cs: 1.5, drag: .99999, bounce: .93, fric: .99, stick: 0, tear: 1e9,  merge: false, burst: 1.3,  tough: 1500, hue: .97 },
+    water:  { name: 'Balloon', ks: 3200, kb: 90, kp: 700, cs: 9, drag: .9995, bounce: .08, fric: .92, stick: 0, tear: 1e9, merge: false, burst: .72, tough: 260, hue: .57, squeeze: .5 },
+    ferro:  { name: 'Ferro', ks: 1700, kb: 300, kp: 430, cs: 22, drag: .9990, bounce: .08, fric: .8, stick: 0, tear: 1.75, merge: true, burst: 9, tough: 600, hue: .72, mag: 1 }
+  };
+  const MKEYS = Object.keys(MATS);
+  const TOOLS = ['Grab', 'Pin', 'Heat', 'Magnet', 'Peg'];
+  const TIPS = {
+    Grab: 'Grab and fling; squash blobs together to merge, pull hard to tear. Tap empty space to poke.',
+    Pin: 'Tap a blob to pop it. Tap empty space to plant a spike; tap a spike to pull it out.',
+    Heat: 'Hold over a blob: the gas expands. Warm honey runs; over-pressured skins burst.',
+    Magnet: 'Hold anywhere: ferrofluid is pulled toward the field and grows spikes.',
+    Peg: 'Tap empty space to place a peg, tap a peg to remove it. Drape things over them.'
+  };
+  const G = 1400, MAXB = 10;
+  const blobs = [], pegs = [], drops = [];
+  let grav = true, grab = null, poke = null, floorY = 600, hueSeed = Math.random();
+  let tool = 'Grab', mat = 'jelly', tool_p = null, tipT = 0;
+  const css = c => `rgb(${c.map(v => clamp(v, 0, 1) * 255 | 0).join(',')})`;
+  function paint(b) {
+    const c = b.rgb, m = MATS[b.m];
+    b.cBase = css(c); b.cLite = css(c.map(v => v + (1 - v) * (m.mag ? .25 : .5))); b.cDark = css(c.map(v => v * (m.mag ? .3 : .45)));
+  }
+  function makeBlob(cx, cy, r, mk, rgb) {
+    const m = MATS[mk], N = Math.round(clamp(r / 2.2, 28, 44));
+    const b = { N, r, m: mk, heat: 0, x: new Float32Array(N), y: new Float32Array(N), vx: new Float32Array(N), vy: new Float32Array(N), fx: new Float32Array(N), fy: new Float32Array(N),
+      ax: new Float32Array(N).fill(NaN), ay: new Float32Array(N), last: 0, mergeT: 0, hitVy: 0, hitT: -9, dwell: {} };
     for (let i = 0; i < N; i++) { const a = i / N * Math.PI * 2; b.x[i] = cx + Math.cos(a) * r; b.y[i] = cy + Math.sin(a) * r; }
     b.rest = 2 * r * Math.sin(Math.PI / N); b.rest2 = 2 * r * Math.sin(2 * Math.PI / N);
     b.A0 = .5 * N * r * r * Math.sin(2 * Math.PI / N);
-    const base = hsl(h, .78, .56), lite = hsl(h + .03, .9, .78), dark = hsl(h - .03, .7, .3);
-    const css = c => `rgb(${c.map(v => v * 255 | 0).join(',')})`;
-    b.cBase = css(base); b.cLite = css(lite); b.cDark = css(dark);
+    if (!rgb) {
+      const h = m.hue == null ? hueSeed + Math.random() * .8 : m.hue + rand(-.02, .02);
+      rgb = m.mag ? [.09, .08, .12] : mk === 'water' ? hsl(h, .7, .6) : hsl(h, .78, mk === 'honey' ? .5 : .56);
+    }
+    b.rgb = rgb; paint(b);
     return b;
   }
   function size() { return clamp(Math.min(W, floorY) * .13, 40, 88); }
   function init() {
-    blobs.length = 0; floorY = bounds().bottom;
-    const r = size(), n = W < 500 ? 3 : 4;
-    for (let i = 0; i < n; i++) blobs.push(makeBlob(W * (i + .5) / n, floorY - r * 1.05 - (i % 2) * r * .3, r * rand(.85, 1.1), hueSeed + i * .21));
+    blobs.length = 0; drops.length = 0; floorY = bounds().bottom;
+    const keep = pegs.filter(g => g.y < floorY - 6 && g.x < W); pegs.length = 0; pegs.push(...keep);
+    const r = size(), n = W < 500 ? 3 : 4, seq = [mat, ...['jelly', 'honey', 'rubber', 'jelly'].filter(k => k !== mat)];
+    for (let i = 0; i < n; i++) blobs.push(makeBlob(W * (i + .5) / n, floorY - r * 1.05 - (i % 2) * r * .3, r * rand(.85, 1.1), seq[i]));
+  }
+  function add(mk, x, y, r) {
+    r = r || size() * rand(.7, 1.05);
+    if (blobs.length >= MAXB) { const k = blobs.findIndex(b => !grab || grab.b !== b); blobs.splice(k, 1); }
+    const b = makeBlob(x == null ? rand(r + 10, W - r - 10) : x, y == null ? 64 + r + 10 : y, r, mk); blobs.push(b); return b;
   }
   function area(b) { let a = 0; for (let i = 0, j = b.N - 1; i < b.N; j = i++) a += b.x[j] * b.y[i] - b.x[i] * b.y[j]; return a * .5; }
+  function perim(b) { let s = 0; for (let i = 0, j = b.N - 1; i < b.N; j = i++) s += Math.hypot(b.x[i] - b.x[j], b.y[i] - b.y[j]); return s; }
   function inside(b, px, py) {
     let c = false;
     for (let i = 0, j = b.N - 1; i < b.N; j = i++) if ((b.y[i] > py) !== (b.y[j] > py) && px < (b.x[j] - b.x[i]) * (py - b.y[i]) / (b.y[j] - b.y[i]) + b.x[i]) c = !c;
     return c;
   }
-  function spring(b, i, j, rest, k) {
+  function centroid(b) { let x = 0, y = 0; for (let i = 0; i < b.N; i++) { x += b.x[i]; y += b.y[i]; } return [x / b.N, y / b.N]; }
+  function vel(b) { let x = 0, y = 0; for (let i = 0; i < b.N; i++) { x += b.vx[i]; y += b.vy[i]; } return [x / b.N, y / b.N]; }
+  function bbox(b) {
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (let i = 0; i < b.N; i++) { const x = b.x[i], y = b.y[i]; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    b.x0 = x0; b.x1 = x1; b.y0 = y0; b.y1 = y1;
+  }
+  function spring(b, i, j, rest, k, cs) {
     const dx = b.x[j] - b.x[i], dy = b.y[j] - b.y[i], d = Math.hypot(dx, dy) || 1e-4, nx = dx / d, ny = dy / d;
-    const f = k * (d - rest) + CS * ((b.vx[j] - b.vx[i]) * nx + (b.vy[j] - b.vy[i]) * ny);
+    const f = k * (d - rest) + cs * ((b.vx[j] - b.vx[i]) * nx + (b.vy[j] - b.vy[i]) * ny);
     b.fx[i] += f * nx; b.fy[i] += f * ny; b.fx[j] -= f * nx; b.fy[j] -= f * ny;
   }
-  function substep(h) {
+  // ---- events: burst, merge, tear ----
+  function burst(b, why) {
+    const k = blobs.indexOf(b); if (k < 0) return;
+    blobs.splice(k, 1); if (grab && grab.b === b) grab = null;
+    const [cx, cy] = centroid(b), m = MATS[b.m], wet = b.m === 'water';
+    const n = Math.min(70, Math.round(b.r * (wet ? 1.1 : .6)));
+    for (let i = 0; i < n; i++) {
+      const j = i % b.N, dx = b.x[j] - cx, dy = b.y[j] - cy, d = Math.hypot(dx, dy) || 1, s = rand(120, wet ? 700 : 420) * (1 + b.heat * .5);
+      drops.push({ x: b.x[j], y: b.y[j], vx: b.vx[j] * .5 + dx / d * s, vy: b.vy[j] * .5 + dy / d * s - rand(0, 150), r: rand(1.5, wet ? 4 : 5), c: b.cBase, life: 1, mag: !!m.mag, sit: 0 });
+    }
+    if (drops.length > 500) drops.splice(0, drops.length - 500);
+    Snd.pop(Math.max(14, b.r * .6)); Snd.blorp(.8, 40 / b.r);
+    try { navigator.vibrate && navigator.vibrate(18); } catch (e) {}
+    if (why === 'pin') discover('slime', 'pin', 'Pinprick', 'A pressurised skin punctured at one point empties all at once.');
+    if (why === 'spike') discover('slime', 'spike', 'Impaled', 'The blob hit a spike faster than its skin could stretch around it.');
+    if (why === 'heat' || why === 'squeeze') discover('slime', 'over', 'Overpressure', why === 'heat' ? 'Heating the gas raised the pressure past what the skin could hold.' : 'Squeezing the water balloon pushed its pressure past the skin\'s limit.');
+  }
+  function merge(A, B) {
+    const aA = Math.abs(area(A)), aB = Math.abs(area(B)), big = aA >= aB ? A : B, t = aB / (aA + aB);
+    const r = Math.sqrt((aA + aB) / Math.PI);
+    if (r > size() * 1.9) return false;
+    const [ax, ay] = centroid(A), [bx, by] = centroid(B), [avx, avy] = vel(A), [bvx, bvy] = vel(B);
+    const rgb = A.rgb.map((v, i) => Math.sqrt(v * v * (1 - t) + B.rgb[i] * B.rgb[i] * t));
+    const nb = makeBlob(ax + (bx - ax) * t, ay + (by - ay) * t, r, big.m, rgb);
+    nb.heat = Math.max(A.heat, B.heat);
+    for (let i = 0; i < nb.N; i++) { nb.vx[i] = avx + (bvx - avx) * t; nb.vy[i] = avy + (bvy - avy) * t; }
+    const g = grab && (grab.b === A || grab.b === B) ? grab.p : null;
+    blobs.splice(blobs.indexOf(A), 1); blobs.splice(blobs.indexOf(B), 1); blobs.push(nb);
+    if (g) grabAt(nb, g); else grab = grab && (grab.b === A || grab.b === B) ? null : grab;
+    Snd.blorp(.9, 30 / r);
+    discover('slime', 'merge', 'Fusion', 'Squeezed hard enough, two skins become one and the gas shares a single volume.');
+    const dh = Math.abs(A.rgb[0] - B.rgb[0]) + Math.abs(A.rgb[1] - B.rgb[1]) + Math.abs(A.rgb[2] - B.rgb[2]);
+    if (dh > .5) discover('slime', 'mix', 'Colour mixing', 'Two colours fused into a blend that neither blob had before.');
+    return true;
+  }
+  function tear(b) {
+    const [cx, cy] = centroid(b);
+    let sxx = 0, syy = 0, sxy = 0;
+    for (let i = 0; i < b.N; i++) { const dx = b.x[i] - cx, dy = b.y[i] - cy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+    const th = .5 * Math.atan2(2 * sxy, sxx - syy), ux = Math.cos(th), uy = Math.sin(th);
+    const halves = [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]];
+    for (let i = 0; i < b.N; i++) { const s = (b.x[i] - cx) * ux + (b.y[i] - cy) * uy > 0 ? 0 : 1, h = halves[s]; h[0] += b.x[i]; h[1] += b.y[i]; h[2] += b.vx[i]; h[3] += b.vy[i]; h[4]++; }
+    const r = Math.sqrt(Math.abs(area(b)) / 2 / Math.PI) * .95;
+    const k = blobs.indexOf(b); blobs.splice(k, 1);
+    const g = grab && grab.b === b ? grab.p : null; if (g) grab = null;
+    for (const h of halves) {
+      if (!h[4]) continue;
+      const nb = makeBlob(h[0] / h[4], h[1] / h[4], r, b.m, b.rgb.slice()); nb.heat = b.heat;
+      for (let i = 0; i < nb.N; i++) { nb.vx[i] = h[2] / h[4]; nb.vy[i] = h[3] / h[4]; }
+      blobs.push(nb);
+      if (g && inside(nb, g.x, g.y)) grabAt(nb, g);
+    }
+    Snd.blorp(.8, 1.6);
+    discover('slime', 'tear', 'Mitosis', 'Stretched past its limit, the skin pinched off into two separate blobs.');
+  }
+  function grabAt(b, p) {
+    const pts = [], R = b.r * 1.1;
+    for (let i = 0; i < b.N; i++) {
+      const dx = b.x[i] - p.x, dy = b.y[i] - p.y, d = Math.hypot(dx, dy);
+      if (d < R) pts.push({ i, w: 1 - d / R * .8, ox: dx * .75, oy: dy * .75 });
+    }
+    if (!pts.length) return false;
+    grab = { b, p, pts, t0: performance.now() }; b.hitT = -9; return true;
+  }
+  // ---- physics ----
+  const events = [];
+  function substep(h, now) {
+    const heatP = tool === 'Heat' && tool_p, magP = tool === 'Magnet' && tool_p;
     for (const b of blobs) {
-      const N = b.N;
+      const N = b.N, m = MATS[b.m], inf = 1 + b.heat * .7, sc = Math.sqrt(inf);
+      const cs = m.cs / (1 + b.heat * 1.5);
       for (let i = 0; i < N; i++) { b.fx[i] = 0; b.fy[i] = grav ? G : 0; }
-      for (let i = 0; i < N; i++) { spring(b, i, (i + 1) % N, b.rest, KS); spring(b, i, (i + 2) % N, b.rest2, KB); }
-      const A = area(b), p = KP * b.A0 / Math.max(Math.abs(A), b.A0 * .15) * Math.sign(A || 1) * .5;
+      for (let i = 0; i < N; i++) { spring(b, i, (i + 1) % N, b.rest * sc, m.ks, cs); spring(b, i, (i + 2) % N, b.rest2 * sc, m.kb, cs); }
+      const A = area(b); b.A = A;
+      const p = m.kp * b.A0 * inf / Math.max(Math.abs(A), b.A0 * .15) * Math.sign(A || 1) * .5;
       for (let i = 0; i < N; i++) {
         const j = (i + 1) % N, ex = b.x[j] - b.x[i], ey = b.y[j] - b.y[i];
         b.fx[i] += ey * p; b.fy[i] -= ex * p; b.fx[j] += ey * p; b.fy[j] -= ex * p;
       }
+      if (m.stick) for (let i = 0; i < N; i++) {
+        if (b.ax[i] !== b.ax[i]) continue;
+        const dx = b.ax[i] - b.x[i], dy = b.ay[i] - b.y[i];
+        if (dx * dx + dy * dy > (22 / (1 + b.heat * 3)) ** 2) { b.ax[i] = NaN; continue; }
+        b.fx[i] += dx * 900 - b.vx[i] * 30; b.fy[i] += dy * 900 - b.vy[i] * 30;
+      }
+      if (magP && m.mag) for (let i = 0; i < N; i++) {
+        const dx = magP.x - b.x[i], dy = magP.y - b.y[i], d2 = dx * dx + dy * dy + 2500, d = Math.sqrt(d2), f = Math.min(6000, 9e7 / d2);
+        b.fx[i] += dx / d * f; b.fy[i] += dy / d * f;
+      }
     }
-    // blob-on-blob contact
-    const rc = 9, kc = 5000;
+    // blob-on-blob contact (bounding boxes first; count contacts for merging)
+    const kc = 5000;
+    for (const b of blobs) bbox(b);
     for (let a = 0; a < blobs.length; a++) for (let c = a + 1; c < blobs.length; c++) {
       const A = blobs[a], B = blobs[c];
-      for (let i = 0; i < A.N; i++) for (let j = 0; j < B.N; j++) {
-        const dx = B.x[j] - A.x[i], dy = B.y[j] - A.y[i]; if (dx > rc || dx < -rc || dy > rc || dy < -rc) continue;
-        const d = Math.hypot(dx, dy) || 1e-3; if (d >= rc) continue;
-        const f = kc * (rc - d) / d; A.fx[i] -= dx * f; A.fy[i] -= dy * f; B.fx[j] += dx * f; B.fy[j] += dy * f;
+      const rc = Math.max(9, .55 * (A.rest * Math.sqrt(1 + A.heat * .7) + B.rest * Math.sqrt(1 + B.heat * .7)));
+      if (A.x1 + rc < B.x0 || B.x1 + rc < A.x0 || A.y1 + rc < B.y0 || B.y1 + rc < A.y0) continue;
+      let n = 0, push = 0;
+      for (let i = 0; i < A.N; i++) {
+        const xi = A.x[i], yi = A.y[i];
+        if (xi < B.x0 - rc || xi > B.x1 + rc || yi < B.y0 - rc || yi > B.y1 + rc) continue;
+        for (let j = 0; j < B.N; j++) {
+          const dx = B.x[j] - xi, dy = B.y[j] - yi; if (dx > rc || dx < -rc || dy > rc || dy < -rc) continue;
+          const d = Math.hypot(dx, dy) || 1e-3; if (d >= rc) continue;
+          const f = kc * (rc - d) / d; A.fx[i] -= dx * f; A.fy[i] -= dy * f; B.fx[j] += dx * f; B.fy[j] += dy * f;
+          n++; push += rc - d;
+        }
       }
+      if (n) events.push([A, B, n, push]);
     }
     if (grab) {
       const b = grab.b;
@@ -950,14 +1081,30 @@ const Slime = (() => {
         b.fy[q.i] += (ty - b.y[q.i]) * 1600 * q.w - b.vy[q.i] * 22 * q.w;
       }
     }
-    const now = performance.now();
-    for (const b of blobs) for (let i = 0; i < b.N; i++) {
-      b.vx[i] = (b.vx[i] + b.fx[i] * h) * .9993; b.vy[i] = (b.vy[i] + b.fy[i] * h) * .9993;
-      b.x[i] += b.vx[i] * h; b.y[i] += b.vy[i] * h;
-      if (b.y[i] > floorY) { if (b.vy[i] > 700 && now - b.last > 140) { b.last = now; Snd.blorp(Math.min(1, b.vy[i] / 2600), 60 / b.r); } b.y[i] = floorY; b.vy[i] *= -.15; b.vx[i] *= .9; }
-      if (b.y[i] < 64) { b.y[i] = 64; b.vy[i] *= -.3; }
-      if (b.x[i] < 4) { b.x[i] = 4; b.vx[i] *= -.3; b.vy[i] *= .95; }
-      if (b.x[i] > W - 4) { b.x[i] = W - 4; b.vx[i] *= -.3; b.vy[i] *= .95; }
+    for (const b of blobs) {
+      const m = MATS[b.m];
+      for (let i = 0; i < b.N; i++) {
+        b.vx[i] = (b.vx[i] + b.fx[i] * h) * m.drag; b.vy[i] = (b.vy[i] + b.fy[i] * h) * m.drag;
+        b.x[i] += b.vx[i] * h; b.y[i] += b.vy[i] * h;
+        let hit = false;
+        if (b.y[i] > floorY) {
+          if (b.vy[i] > 700 && now - b.last > 140) { b.last = now; Snd.blorp(Math.min(1, b.vy[i] / 2600), 60 / b.r); if (b.m === 'rubber' && !(grab && grab.b === b)) { b.hitVy = Math.max(b.hitVy, b.vy[i]); b.hitT = now; } }
+          b.y[i] = floorY; b.vy[i] *= -m.bounce; b.vx[i] *= m.fric; hit = true;
+        }
+        if (b.y[i] < 64) { b.y[i] = 64; b.vy[i] *= -.3; hit = true; }
+        if (b.x[i] < 4) { b.x[i] = 4; b.vx[i] *= -Math.max(.3, m.bounce); b.vy[i] *= .95; hit = true; }
+        if (b.x[i] > W - 4) { b.x[i] = W - 4; b.vx[i] *= -Math.max(.3, m.bounce); b.vy[i] *= .95; hit = true; }
+        for (const g of pegs) {
+          const dx = b.x[i] - g.x, dy = b.y[i] - g.y, d2 = dx * dx + dy * dy, R = g.r + 3;
+          if (d2 >= R * R) continue;
+          const d = Math.sqrt(d2) || 1e-3, nx = dx / d, ny = dy / d, vn = b.vx[i] * nx + b.vy[i] * ny;
+          if (g.spike && -vn > m.tough / (1 + b.heat)) { events.push([b, null, 'spike']); }
+          b.x[i] = g.x + nx * R; b.y[i] = g.y + ny * R;
+          if (vn < 0) { b.vx[i] -= vn * nx * (1 + m.bounce); b.vy[i] -= vn * ny * (1 + m.bounce); }
+          b.vx[i] *= m.fric; b.vy[i] *= m.fric; hit = true; if (!g.spike) b.pegT = now;
+        }
+        if (hit && m.stick && b.ax[i] !== b.ax[i] && b.heat < .5) { b.ax[i] = b.x[i]; b.ay[i] = b.y[i]; }
+      }
     }
     for (const p of P.values()) if (poke && poke.p === p) {
       const R = 30;
@@ -967,25 +1114,119 @@ const Slime = (() => {
       }
     }
   }
-  function centroid(b) { let x = 0, y = 0; for (let i = 0; i < b.N; i++) { x += b.x[i]; y += b.y[i]; } return [x / b.N, y / b.N]; }
+  // once per frame: heat, merging, tearing, bursting, discoveries
+  function judge(dt, now) {
+    const heatP = tool === 'Heat' && tool_p;
+    const touching = new Map();
+    for (const e of events) {
+      if (e[2] === 'spike') { if (blobs.includes(e[0])) burst(e[0], 'spike'); continue; }
+      const [A, B, n] = e, key = A.N < B.N ? A : B;
+      const cur = touching.get(A) || 0; touching.set(A, cur + n); touching.set(B, (touching.get(B) || 0) + n);
+      if (!MATS[A.m].merge || !MATS[B.m].merge) continue;
+      const k = e[3] / Math.min(A.N, B.N);
+      e.push(k);
+    }
+    // merge the most-squeezed eligible pair (per frame, contacts accumulate over substeps)
+    const pairs = new Map();
+    for (const e of events) if (e[4] != null) { const id = e[0].N + ':' + blobs.indexOf(e[0]) + ':' + blobs.indexOf(e[1]); const q = pairs.get(id) || [e[0], e[1], 0, 0]; q[2] += e[2]; q[3] += e[4]; pairs.set(id, q); }
+    events.length = 0;
+    for (const [A, B, n, k] of pairs.values()) {
+      if (!blobs.includes(A) || !blobs.includes(B)) continue;
+      const steps = Math.max(1, Math.round(dt * 720));
+      const squeeze = k / steps, contacts = n / steps;
+      const held = grab && (grab.b === A || grab.b === B);
+      if (contacts > Math.min(A.N, B.N) * .4 && squeeze > (held ? .45 : .9)) {
+        A.mergeT += dt; if (A.mergeT > .12) { A.mergeT = 0; merge(A, B); break; }
+      } else A.mergeT = Math.max(0, A.mergeT - dt);
+    }
+    for (const b of blobs.slice()) {
+      const m = MATS[b.m], [cx, cy] = centroid(b);
+      // heat
+      if (heatP) {
+        const d = Math.hypot(heatP.x - cx, heatP.y - cy);
+        if (d < b.r * 1.3 + 40 || inside(b, heatP.x, heatP.y)) b.heat = Math.min(1.6, b.heat + dt * .7);
+      }
+      b.heat = Math.max(0, b.heat - dt * .12);
+      if (b.heat > m.burst) { burst(b, 'heat'); continue; }
+      if (m.squeeze && Math.abs(b.A) < b.A0 * (1 + b.heat * .7) * m.squeeze) { burst(b, 'squeeze'); continue; }
+      // tearing
+      const pr = perim(b) / (b.N * b.rest * Math.sqrt(1 + b.heat * .7));
+      b.dwell.tear = pr > m.tear && b.r > 26 ? (b.dwell.tear || 0) + dt : 0;
+      if (b.dwell.tear > .18) { tear(b); continue; }
+      const still = Math.hypot(...vel(b)) < 40, held = grab && grab.b === b;
+      // superball
+      if (held) b.hitVy = 0;
+      if (b.m === 'rubber' && b.hitVy > 900 && !held && cy < floorY - (floorY - 64) * .35) discover('slime', 'bounce', 'Superball', 'A stiff rubber skin hands almost all of the impact back as a rebound.');
+      // honey hanging from the ceiling or wall
+      if (m.stick && grav && !held) {
+        let top = 0, any = 0; for (let i = 0; i < b.N; i++) if (b.ax[i] === b.ax[i]) { any++; if (b.ay[i] < 70) top++; }
+        const hang = top >= 2 && b.y1 < floorY - 20;
+        b.dwell.hang = hang ? (b.dwell.hang || 0) + dt : 0;
+        if (b.dwell.hang > .7) discover('slime', 'hang', 'Ceiling drip', 'Honey clings where it touched, and hangs there, sagging, against gravity.');
+        if (any === 0 && b.heat > .2 && b.dwell.wasStuck) discover('slime', 'runny', 'Runny honey', 'Warm honey lost its grip: heat thins it and weakens how hard it sticks.');
+        b.dwell.wasStuck = any > 2 && b.y1 < floorY - 8 ? true : any > 0 ? b.dwell.wasStuck : b.dwell.wasStuck && b.heat > .2;
+      }
+      // ferrofluid lifted by the magnet
+      if (m.mag && tool === 'Magnet' && tool_p && !held && b.y1 < floorY - 12 && cy > tool_p.y - b.r) {
+        b.dwell.lift = (b.dwell.lift || 0) + dt; if (b.dwell.lift > .6) discover('slime', 'mag', 'Magnetic lift', 'The field pulls harder than gravity: the ferrofluid climbs toward it and spikes up along the field lines.');
+      } else b.dwell.lift = 0;
+      // draped over a peg
+      if (!held && pegs.length && b.y1 < floorY - 6 && still) {
+        const on = now - (b.pegT || 0) < 100;
+        b.dwell.drape = on ? (b.dwell.drape || 0) + dt : 0;
+        if (b.dwell.drape > .8) discover('slime', 'drape', 'Draped', 'Resting on a peg, the blob sags into a saddle shape with nothing below it.');
+      } else b.dwell.drape = 0;
+    }
+  }
+  // ---- drawing ----
+  function outline(b, spikes) {
+    const N = b.N;
+    ctx.beginPath();
+    if (spikes) {
+      const [cx, cy] = centroid(b);
+      for (let i = 0; i < N; i++) {
+        const j = (i + 1) % N, s = spikes[i];
+        const mx = (b.x[i] + b.x[j]) / 2, my = (b.y[i] + b.y[j]) / 2;
+        if (!i) ctx.moveTo(mx, my);
+        const dx = b.x[j] - cx, dy = b.y[j] - cy, d = Math.hypot(dx, dy) || 1;
+        const sj = spikes[j];
+        ctx.quadraticCurveTo(b.x[i] + (b.x[i] - cx) / (Math.hypot(b.x[i] - cx, b.y[i] - cy) || 1) * s, b.y[i] + (b.y[i] - cy) / (Math.hypot(b.x[i] - cx, b.y[i] - cy) || 1) * s, mx + dx / d * sj * .1, my + dy / d * sj * .1);
+      }
+    } else {
+      ctx.moveTo((b.x[N - 1] + b.x[0]) / 2, (b.y[N - 1] + b.y[0]) / 2);
+      for (let i = 0; i < N; i++) { const j = (i + 1) % N; ctx.quadraticCurveTo(b.x[i], b.y[i], (b.x[i] + b.x[j]) / 2, (b.y[i] + b.y[j]) / 2); }
+    }
+    ctx.closePath();
+  }
   function draw(b) {
-    const [cx, cy] = centroid(b);
-    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
-    for (let i = 0; i < b.N; i++) { x0 = Math.min(x0, b.x[i]); x1 = Math.max(x1, b.x[i]); y0 = Math.min(y0, b.y[i]); y1 = Math.max(y1, b.y[i]); }
-    const rx = (x1 - x0) / 2, ry = (y1 - y0) / 2;
-    // contact shadow on the floor
-    const lift = clamp((floorY - y1) / 200, 0, 1);
+    const [cx, cy] = centroid(b), m = MATS[b.m];
+    const rx = (b.x1 - b.x0) / 2, ry = (b.y1 - b.y0) / 2;
+    const lift = clamp((floorY - b.y1) / 200, 0, 1);
     ctx.fillStyle = `rgba(0,0,0,${.45 * (1 - lift)})`;
     ctx.beginPath(); ctx.ellipse(cx, floorY + 4, rx * (1 - lift * .4), 6, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath();
-    const N = b.N;
-    ctx.moveTo((b.x[N - 1] + b.x[0]) / 2, (b.y[N - 1] + b.y[0]) / 2);
-    for (let i = 0; i < N; i++) { const j = (i + 1) % N; ctx.quadraticCurveTo(b.x[i], b.y[i], (b.x[i] + b.x[j]) / 2, (b.y[i] + b.y[j]) / 2); }
-    ctx.closePath();
-    const gr = ctx.createRadialGradient(cx - rx * .35, cy - ry * .4, Math.max(2, Math.min(rx, ry) * .1), cx, cy, Math.max(rx, ry) * 1.25);
+    // honey strands to its anchors
+    if (m.stick) {
+      ctx.strokeStyle = b.cBase; ctx.lineWidth = 2; ctx.beginPath();
+      for (let i = 0; i < b.N; i++) if (b.ax[i] === b.ax[i]) { ctx.moveTo(b.x[i], b.y[i]); ctx.lineTo(b.ax[i], b.ay[i]); }
+      ctx.stroke();
+    }
+    let spikes = null;
+    if (m.mag && tool === 'Magnet' && tool_p) {
+      spikes = new Float32Array(b.N);
+      for (let i = 0; i < b.N; i++) {
+        const nx = b.x[i] - cx, ny = b.y[i] - cy, nd = Math.hypot(nx, ny) || 1;
+        const dx = tool_p.x - b.x[i], dy = tool_p.y - b.y[i], d = Math.hypot(dx, dy) || 1;
+        const B = Math.min(1, 9000 / (d * d / 100 + 60)), al = (nx * dx + ny * dy) / (nd * d);
+        spikes[i] = (i & 1) ? Math.max(0, al) * B * 26 : -2;
+      }
+    }
+    outline(b, spikes);
+    const gr = ctx.createRadialGradient(cx - rx * .35, cy - ry * .4, Math.max(2, Math.min(rx, ry) * .1), cx, cy, Math.max(rx, ry, 4) * 1.25);
     gr.addColorStop(0, b.cLite); gr.addColorStop(.45, b.cBase); gr.addColorStop(1, b.cDark);
-    ctx.fillStyle = gr; ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.globalAlpha = b.m === 'water' ? .72 : 1;
+    ctx.fillStyle = gr; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.strokeStyle = b.m === 'rubber' ? 'rgba(255,255,255,.3)' : 'rgba(255,255,255,.18)'; ctx.lineWidth = b.m === 'rubber' ? 2.5 : 1.5; ctx.stroke();
+    if (b.heat > .05) { ctx.strokeStyle = `rgba(255,${120 - b.heat * 50 | 0},40,${Math.min(.8, b.heat * .6)})`; ctx.lineWidth = 3; ctx.stroke(); }
     ctx.save(); ctx.clip();
     ctx.fillStyle = 'rgba(255,255,255,.42)';
     ctx.beginPath(); ctx.ellipse(cx - rx * .34, cy - ry * .5, rx * .34, ry * .15, -.45, 0, Math.PI * 2); ctx.fill();
@@ -993,42 +1234,95 @@ const Slime = (() => {
     ctx.beginPath(); ctx.ellipse(cx - rx * .52, cy - ry * .56, rx * .07, ry * .05, -.45, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
+  function drawPeg(g) {
+    if (g.spike) {
+      ctx.fillStyle = '#b9c0cc'; ctx.beginPath(); ctx.moveTo(g.x, g.y - g.r * 2.2); ctx.lineTo(g.x + g.r, g.y + g.r * .6); ctx.lineTo(g.x - g.r, g.y + g.r * .6); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#5a6170'; ctx.fillRect(g.x - 1.5, g.y, 3, floorY - g.y);
+    } else {
+      const gr = ctx.createRadialGradient(g.x - 3, g.y - 3, 1, g.x, g.y, g.r);
+      gr.addColorStop(0, '#9aa3b4'); gr.addColorStop(1, '#3a404d');
+      ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  function pegAt(x, y) { return pegs.findIndex(g => Math.hypot(g.x - x, g.y - y) < g.r + 14); }
+  function blobAt(x, y) { for (let k = blobs.length - 1; k >= 0; k--) if (inside(blobs[k], x, y)) return blobs[k]; return null; }
   let acc = 0;
   return {
-    name: 'Slime', canvas: '2d', hint: 'Grab a blob and fling it. Tap empty space to poke.',
-    enter() { if (!blobs.length) init(); },
+    name: 'Slime', canvas: '2d', hint: 'Grab, fling, squash two together. Try the tools and materials up top.',
+    enter() { if (!blobs.length) init(); tipT = 4; },
+    leave() { subEl.textContent = ''; tool_p = null; grab = null; poke = null; },
     resize() { init(); },
     down(p) {
-      for (let k = blobs.length - 1; k >= 0; k--) {
-        const b = blobs[k];
-        if (!inside(b, p.x, p.y)) continue;
-        const pts = [], R = b.r * 1.1;
-        for (let i = 0; i < b.N; i++) {
-          const dx = b.x[i] - p.x, dy = b.y[i] - p.y, d = Math.hypot(dx, dy);
-          if (d < R) pts.push({ i, w: 1 - d / R * .8, ox: dx * .75, oy: dy * .75 });
-        }
-        if (!pts.length) continue;
-        grab = { b, p, pts }; Snd.blorp(.5, 1.3); return;
+      if (tool === 'Grab') {
+        const b = blobAt(p.x, p.y);
+        if (b && grabAt(b, p)) { Snd.blorp(.5, 1.3); return; }
+        poke = { p }; Snd.blorp(.35, 1.8); return;
       }
-      poke = { p }; Snd.blorp(.35, 1.8);
+      if (tool === 'Pin') {
+        const b = blobAt(p.x, p.y); if (b) { burst(b, 'pin'); return; }
+        const k = pegAt(p.x, p.y); if (k >= 0) { pegs.splice(k, 1); Snd.tick(900); return; }
+        if (p.y < floorY - 10 && pegs.length < 16) { pegs.push({ x: p.x, y: p.y, r: 7, spike: true }); Snd.tick(1400); }
+        return;
+      }
+      if (tool === 'Peg') {
+        const k = pegAt(p.x, p.y); if (k >= 0) { pegs.splice(k, 1); Snd.tick(700); return; }
+        if (p.y < floorY - 12 && !blobAt(p.x, p.y) && pegs.length < 16) { pegs.push({ x: p.x, y: p.y, r: 11 }); Snd.tick(500); }
+        return;
+      }
+      tool_p = p;
     },
-    up(p) { if (grab && grab.p === p) { grab = null; Snd.blorp(.4, 1.1); } if (poke && poke.p === p) poke = null; },
+    move(p) {
+      if (tool === 'Pin' && P.size && p.moved) { const b = blobAt(p.x, p.y); if (b) burst(b, 'pin'); }
+    },
+    up(p) {
+      if (grab && grab.p === p) { grab = null; Snd.blorp(.4, 1.1); }
+      if (poke && poke.p === p) poke = null;
+      if (tool_p === p) tool_p = null;
+    },
     frame(dt) {
+      const now = performance.now();
       acc = Math.min(acc + dt, 1 / 20); const h = 1 / 720;
-      while (acc >= h) { substep(h); acc -= h; }
+      while (acc >= h) { substep(h, now); acc -= h; }
+      judge(dt, now);
+      for (const b of blobs) bbox(b);
       ctx.fillStyle = '#0d0f16'; ctx.fillRect(0, 0, W, H);
       const fg = ctx.createLinearGradient(0, floorY, 0, H);
       fg.addColorStop(0, '#171a24'); fg.addColorStop(1, '#0d0f16');
       ctx.fillStyle = fg; ctx.fillRect(0, floorY, W, H - floorY);
       ctx.fillStyle = 'rgba(255,255,255,.1)'; ctx.fillRect(0, floorY, W, 1);
+      // droplets from bursts
+      for (const d of drops) {
+        if (!d.sit) {
+          d.vy += (grav ? G : 0) * dt; d.x += d.vx * dt; d.y += d.vy * dt;
+          if (d.mag && tool === 'Magnet' && tool_p) { const dx = tool_p.x - d.x, dy = tool_p.y - d.y, q = Math.max(900, dx * dx + dy * dy); d.vx += dx / Math.sqrt(q) * 2.4e7 / q * dt; d.vy += dy / Math.sqrt(q) * 2.4e7 / q * dt; }
+          if (d.y > floorY - d.r * .4) { d.y = floorY - d.r * .4; d.vy *= -.2; d.vx *= .6; if (Math.abs(d.vy) < 40) d.sit = 1; }
+          if (d.x < 2 || d.x > W - 2) { d.vx *= -.4; d.x = clamp(d.x, 2, W - 2); }
+        }
+        d.life -= dt * (d.sit ? .25 : .08);
+      }
+      for (let i = drops.length - 1; i >= 0; i--) if (drops[i].life <= 0) drops.splice(i, 1);
+      for (const d of drops) { ctx.globalAlpha = Math.min(1, d.life * 2); ctx.fillStyle = d.c; ctx.beginPath(); d.sit ? ctx.ellipse(d.x, d.y, d.r * 1.8, d.r * .5, 0, 0, Math.PI * 2) : ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill(); }
+      ctx.globalAlpha = 1;
+      for (const g of pegs) drawPeg(g);
       for (const b of blobs) draw(b);
       if (poke) { ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(poke.p.x, poke.p.y, 28, 0, Math.PI * 2); ctx.stroke(); }
+      if (tool_p) {
+        const hot = tool === 'Heat';
+        const gr = ctx.createRadialGradient(tool_p.x, tool_p.y, 2, tool_p.x, tool_p.y, 70);
+        gr.addColorStop(0, hot ? 'rgba(255,140,60,.45)' : 'rgba(150,170,255,.35)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(tool_p.x, tool_p.y, 70, 0, Math.PI * 2); ctx.fill();
+        if (!hot) { ctx.strokeStyle = 'rgba(170,190,255,.25)'; ctx.lineWidth = 1; for (let k = 1; k < 4; k++) { ctx.beginPath(); ctx.arc(tool_p.x, tool_p.y, k * 22 + (now / 30 % 22), 0, Math.PI * 2); ctx.stroke(); } }
+      }
+      tipT -= dt;
+      subEl.textContent = tipT > 0 ? TIPS[tool] : `${MATS[mat].name} · ${tool} · ${discovered('slime')}/11 discovered`;
     },
     chips() {
       return [
-        { label: 'Add blob', act() { const r = size() * rand(.7, 1.15); if (blobs.length >= 7) blobs.shift(); blobs.push(makeBlob(rand(r + 10, W - r - 10), 64 + r + 10, r, Math.random())); } },
-        { label: 'Gravity', on: grav, act() { grav = !grav; if (!grav) for (const b of blobs) { const vx = rand(-160, 160), vy = rand(-420, -160); for (let i = 0; i < b.N; i++) { b.vx[i] += vx; b.vy[i] += vy; } } } },
-        { label: 'Reset', act() { hueSeed = Math.random(); grab = null; init(); } }
+        { label: tool + ' ▾', act() { tool = TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]; grab = null; poke = null; tool_p = null; tipT = 4; } },
+        { label: MATS[mat].name + ' ▾', act() { mat = MKEYS[(MKEYS.indexOf(mat) + 1) % MKEYS.length]; tipT = 0; } },
+        { label: '+ Drop', act() { add(mat); } },
+        { label: 'Gravity', on: grav, act() { grav = !grav; if (!grav) for (const b of blobs) { const vx = rand(-160, 160), vy = rand(-420, -160); for (let i = 0; i < b.N; i++) { b.vx[i] += vx; b.vy[i] += vy; b.ax[i] = NaN; } } } },
+        { label: 'Reset', act() { hueSeed = Math.random(); grab = null; pegs.length = 0; init(); } }
       ];
     }
   };
@@ -1102,24 +1396,153 @@ const Pend = (() => {
 
 /* ================= POP: bubble wrap ================= */
 const Bub = (() => {
-  let bubbles = [], total = store.get('pops', 0), slide = 0, nextAt = 0, puffs = [], dirty = false;
+  // Every bubble holds a mass of air. Pressing shrinks its volume, so pressure = air / volume rises.
+  // Neighbours are separated by heat seals; a big enough pressure difference rips a seal and air flows through,
+  // so squeezing slowly can move air into a neighbour instead of popping. A pop sends a shock into its neighbours.
+  const SHEETS = {
+    small: { name: 'Small', r: 13, burst: [2.4, 3.0], seal: [1.9, 3.4], shape: 'round' },
+    large: { name: 'Large', r: 30, burst: [2.0, 2.4], seal: [1.4, 3.0], shape: 'round' },
+    hex:   { name: 'Honeycomb', r: 20, burst: [2.2, 2.6], seal: [1.1, 2.2], shape: 'hex' },
+    chan:  { name: 'Channels', r: 18, burst: [2.1, 2.5], seal: [1.5, 3.0], shape: 'round', chan: true }
+  };
+  const SKEYS = Object.keys(SHEETS);
+  const TOOLS = ['Press', 'Roller', 'Stomp'];
+  const TIPS = {
+    Press: 'Press and drag. Press slowly and air can squeeze into the next bubble instead.',
+    Roller: 'Drag the roller over the sheet, or fling it. It pushes air ahead of itself.',
+    Stomp: 'Hold to stomp a whole patch at once; air has nowhere to go.'
+  };
+  let bubbles = [], links = [], total = store.get('pops', 0), best = store.get('bubbest', 0), slide = 0, nextAt = 0, puffs = [], dirty = false;
+  let sheet = 'large', tool = 'Press', tipT = 0, combo = 0, comboT = 0, recent = [], roller = null, stomp = null, cleared = false, taps = [];
+  const sprites = {};
+  function sprite(shape) {
+    if (sprites[shape]) return sprites[shape];
+    const S = 96, c = document.createElement('canvas'); c.width = c.height = S; const g = c.getContext('2d'), R = S / 2 - 2;
+    const path = () => { g.beginPath(); if (shape === 'hex') { for (let k = 0; k < 6; k++) { const a = k / 6 * Math.PI * 2 + Math.PI / 6; g.lineTo(S / 2 + Math.cos(a) * R, S / 2 + Math.sin(a) * R); } g.closePath(); } else g.arc(S / 2, S / 2, R, 0, Math.PI * 2); };
+    const gr = g.createRadialGradient(S / 2 - R * .35, S / 2 - R * .4, R * .05, S / 2, S / 2, R);
+    gr.addColorStop(0, 'rgba(255,255,255,.55)'); gr.addColorStop(.35, 'rgba(190,220,255,.2)'); gr.addColorStop(1, 'rgba(120,170,220,.16)');
+    path(); g.fillStyle = gr; g.fill(); g.strokeStyle = 'rgba(220,235,255,.3)'; g.lineWidth = 2.4; g.stroke();
+    g.fillStyle = 'rgba(255,255,255,.8)'; g.beginPath(); g.ellipse(S / 2 - R * .38, S / 2 - R * .42, R * .16, R * .09, -.6, 0, Math.PI * 2); g.fill();
+    return sprites[shape] = c;
+  }
   function init(fromRight) {
-    const B = bounds();
-    const r = clamp(Math.min(W, H) / 13, 20, 32), dx = r * 2.3, dy = dx * .866;
+    const B = bounds(), T = SHEETS[sheet];
+    const r = clamp(T.r * Math.min(1.25, Math.max(.8, Math.min(W, H) / 420)), 10, 40);
+    const hex = T.shape === 'hex', dx = hex ? r * 1.78 : r * 2.3, dy = dx * .866;
     const rows = Math.floor((B.bottom - B.top - 20) / dy), cols = Math.floor((W - 20) / dx);
     const ox = (W - (cols - 1) * dx) / 2, oy = B.top + 10 + ((B.bottom - B.top - 20) - (rows - 1) * dy) / 2;
-    bubbles = [];
+    bubbles = []; links = []; const grid = {};
     for (let j = 0; j < rows; j++) for (let i = 0; i < cols - (j & 1 ? 1 : 0); i++) {
-      const seed = Math.random() * 1000;
-      bubbles.push({ x: ox + i * dx + (j & 1 ? dx / 2 : 0), y: oy + j * dy, r: r * rand(.9, 1.04), s: 0, popped: false, seed, press: false });
+      const b = { x: ox + i * dx + (j & 1 ? dx / 2 : 0), y: oy + j * dy, r: r * (hex ? 1 : rand(.9, 1.04)), s: 0, m: 1, p: 1, v0: 1, kick: 0, popped: false, seed: Math.random() * 1000,
+        press: 0, burstAt: rand(...T.burst), nb: [], ch: -1, cause: null, depth: 0, touched: 0, i, j };
+      grid[i + ',' + j] = b; bubbles.push(b);
     }
-    slide = fromRight ? W : 0; nextAt = 0;
+    // neighbours on the offset-row lattice
+    const nbr = (i, j) => { const o = j & 1; return [[i + 1, j], [i - 1 + o, j + 1], [i + o, j + 1]]; };
+    for (const b of bubbles) for (const [i, j] of nbr(b.i, b.j)) {
+      const c = grid[i + ',' + j]; if (!c) continue;
+      const L = { a: b, b: c, seal: rand(...T.seal), open: false, chan: false };
+      links.push(L); b.nb.push(L); c.nb.push(L);
+    }
+    if (T.chan) { // sealed channels: horizontal runs of 3–7 bubbles share one air space
+      let id = 0;
+      for (let j = 0; j < rows; j++) {
+        let i = 0; const n = cols - (j & 1 ? 1 : 0);
+        while (i < n) {
+          const len = Math.min(n - i, 3 + (Math.random() * 5 | 0));
+          if (len >= 3 && (j % 2 === 0 || Math.random() < .5)) {
+            for (let k = i; k < i + len; k++) { grid[k + ',' + j].ch = id; const L = links.find(L => L.a === grid[k + ',' + j] && L.b === grid[(k + 1) + ',' + j]); if (L && k < i + len - 1) { L.open = L.chan = true; } }
+            id++;
+          }
+          i += len + 1;
+        }
+      }
+    }
+    slide = fromRight ? W : 0; nextAt = 0; cleared = false; roller = null; stomp = null;
   }
-  function pop(b) {
-    b.popped = true; total++; dirty = true;
-    Snd.pop(b.r);
-    try { navigator.vibrate && navigator.vibrate(8); } catch (e) {}
-    for (let k = 0; k < 6; k++) { const a = Math.random() * 6.28; puffs.push({ x: b.x, y: b.y, vx: Math.cos(a) * rand(40, 120), vy: Math.sin(a) * rand(40, 120), life: 1 }); }
+  function vol(b) { return b.v0 * (1 - .75 * b.s) * (1 + .3 * (b.m - 1)); }
+  function pop(b, cause) {
+    if (b.popped) return;
+    const over = b.m;
+    b.popped = true; total++; dirty = true; b.cause = cause;
+    const pr = b.p;
+    Snd.pop(b.r * clamp(1.4 - (over - 1) * .5, .5, 1.4));
+    try { navigator.vibrate && navigator.vibrate(over > 1.5 ? 20 : 8); } catch (e) {}
+    const np = Math.round(4 + over * 4);
+    for (let k = 0; k < np; k++) { const a = Math.random() * 6.28, sp = rand(40, 120) * over; puffs.push({ x: b.x, y: b.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1 }); }
+    const now = performance.now();
+    combo = now - comboT < 650 ? combo + 1 : 1; comboT = now;
+    if (combo > best) { best = combo; store.set('bubbest', best); }
+    recent.push(now);
+    // shock: the burst snaps the film and slams its neighbours
+    for (const L of b.nb) { const c = L.a === b ? L.b : L.a; if (!c.popped) { c.kick = Math.max(c.kick, (pr - 1) * .6); c.cause = { depth: (cause && cause.depth || 0) + 1, from: b }; } }
+    b.m = 1; b.p = 1;
+    if (over > 1.25) discover('bub', 'big', 'Big bang', 'A bubble swollen with its neighbours\' air pops louder than any normal one.');
+    if (cause && cause.depth >= 3) discover('bub', 'chain', 'Chain reaction', 'Each pop\'s shock pushed an over-full neighbour past its limit, and so on down the line.');
+    if (cause && cause.roller && over > 1.3) discover('bub', 'bow', 'Bow wave', 'The roller shoved air ahead of itself into one bubble until it blew.');
+    if (b.ch >= 0 && !b.touched) discover('bub', 'pipe', 'Pipeline', 'You pressed one end of a sealed channel and a bubble burst at the other.');
+    if (combo >= 30) discover('bub', 'combo', 'Combo ×30', 'Thirty pops, none more than a beat apart.');
+  }
+  function pressAt(x, y, R, depth, flag) {
+    for (const b of bubbles) { if (b.popped) continue; const dx = x - b.x, dy = y - b.y, rr = b.r + R; if (dx * dx + dy * dy < rr * rr) { b.press = Math.max(b.press, depth); b.touched = 1; if (flag) b.roll = 1; } }
+  }
+  function step(dt) {
+    for (const b of bubbles) { b.press = 0; b.roll = 0; b.touched = 0; }
+    if (!slide) {
+      for (const t of taps) t.left -= dt; taps = taps.filter(t => t.left > 0);
+      if (tool === 'Press') for (const t of taps) pressAt(t.x, t.y, -2, 1);
+      if (tool === 'Press') for (const p of P.values()) {
+        const steps = Math.max(1, Math.ceil(Math.hypot(p.x - p.px, p.y - p.py) / 8));
+        for (let s = 0; s <= steps; s++) pressAt(p.px + (p.x - p.px) * s / steps, p.py + (p.y - p.py) * s / steps, -2, 1);
+      }
+      if (roller) {
+        const B = bounds();
+        if (!roller.p) { roller.y += roller.vy * dt; roller.vy *= Math.pow(.35, dt); if (roller.y < B.top + 10 || roller.y > B.bottom - 10) { roller.vy *= -.5; roller.y = clamp(roller.y, B.top + 10, B.bottom - 10); } }
+        else { const ny = roller.p.y; roller.vy = roller.vy * .7 + (ny - roller.y) / Math.max(dt, 1e-3) * .3; roller.y = ny; roller.x = roller.p.x; }
+        const L = roller.L, n = Math.ceil(L / 10);
+        if (roller.p || Math.abs(roller.vy) > 15) for (let k = 0; k <= n; k++) pressAt(roller.x - L / 2 + L * k / n, roller.y, -roller.R * .2, 1, true);
+        // leading edge: half-pressed band ahead of the roller in its direction of travel
+        const dir = Math.sign(roller.vy) || 0;
+        if (dir && (roller.p || Math.abs(roller.vy) > 15)) for (let k = 0; k <= n; k++) pressAt(roller.x - L / 2 + L * k / n, roller.y + dir * roller.R * .9, -roller.R * .5, .3, true);
+        roller.spin += roller.vy * dt / roller.R;
+      }
+      if (stomp) { stomp.d = Math.min(1, stomp.d + dt * (stomp.p ? 6 : -8)); if (stomp.d > 0) pressAt(stomp.x, stomp.y, stomp.R - 12, stomp.d); else stomp = null; }
+    }
+    const H = 1 / 240, n = Math.max(1, Math.round(dt / H)), h = dt / n;
+    for (let it = 0; it < n; it++) {
+      for (const b of bubbles) {
+        if (b.popped) continue;
+        b.s = b.press > b.s ? Math.min(b.press, b.s + h * 14) : Math.max(b.press, b.s - h * 7);
+        b.p = b.m / vol(b) + b.kick;
+        b.kick *= Math.pow(.004, h);
+      }
+      for (const L of links) {
+        const A = L.a, B = L.b;
+        const pa = A.popped ? 1 : A.p, pb = B.popped ? 1 : B.p, d = pa - pb;
+        if (!L.open) { if (!A.popped && !B.popped && Math.abs(d) > L.seal) { L.open = true; L.c = 9; Snd.tick(260 + Math.random() * 120); discover('bub', 'seal', 'Blown seal', 'The pressure difference ripped the seal between two bubbles; now they share their air.'); } else continue; }
+        if (!L.chan) L.c = Math.max(1.2, L.c - h * 5); // a fresh tear gushes, then the gap settles into a narrow leak
+        const q = clamp(d * (L.chan ? 10 : L.c) * h, B.popped ? -1 : -B.m * .15, A.popped ? 1 : A.m * .15);
+        if (!A.popped) A.m = Math.max(.05, A.m - q);
+        if (!B.popped) B.m = Math.max(.05, B.m + q);
+      }
+      for (const b of bubbles) {
+        if (b.popped) continue;
+        b.p = b.m / vol(b) + b.kick;
+        if (b.p > b.burstAt) {
+          const c = b.kick > .1 && b.cause && !b.press ? b.cause : b.roll ? { depth: 0, roller: true } : null;
+          pop(b, c); continue;
+        }
+        if (b.m > 1.3) discover('bub', 'fat', 'Fat bubble', 'Air squeezed through a broken seal and swelled the bubble next door.');
+        if (b.s > .9 && b.m < .6 && b.v0 === 1) { b.v0 = .45; discover('bub', 'dud', 'The dud', 'Its air leaked into a neighbour instead of bursting, and the film creased flat.'); } // crushed with no air inside: the film creases and stays down
+      }
+    }
+    // vented channels: a channel bubble deflates through a popped mate
+    if (SHEETS[sheet].chan) for (const b of bubbles) if (!b.popped && b.ch >= 0 && b.m < .8 && b.s < .1) {
+      if (b.nb.some(L => L.chan && (L.a.popped || L.b.popped))) discover('bub', 'vent', 'Vented', 'A hole anywhere in a sealed channel lets the whole channel go flat.');
+    }
+    const now = performance.now();
+    while (recent.length && now - recent[0] > 200) recent.shift();
+    if (recent.length >= 8) discover('bub', 'stomp', 'Stampede', 'Eight bubbles burst in a fifth of a second: pressed together, none can leak into another.');
   }
   function crinkle(b) {
     ctx.beginPath();
@@ -1129,36 +1552,41 @@ const Bub = (() => {
     }
     ctx.closePath();
   }
+  function roll0(p) { const B = bounds(); roller = { x: p ? p.x : W / 2, y: p ? p.y : B.top + 70, vy: 0, R: 22, L: Math.min(W * .7, 280), p: p || null, spin: 0 }; }
   return {
-    name: 'Pop', canvas: '2d', hint: 'Press and drag across the bubbles.',
-    enter() { if (!bubbles.length) init(false); },
+    name: 'Pop', canvas: '2d', hint: 'Press and drag across the bubbles. Try slow presses, the roller and stomp.',
+    enter() { if (!bubbles.length) init(false); tipT = 4; },
+    leave() { subEl.textContent = ''; },
     resize() { init(false); },
+    down(p) {
+      if (tool === 'Roller') { if (roller && Math.abs(p.y - roller.y) < 60) { roller.p = p; } else roll0(p); }
+      if (tool === 'Stomp') { stomp = { x: p.x, y: p.y, R: Math.min(110, W * .22), d: 0, p }; Snd.blorp(.6, .5); }
+    },
+    up(p) {
+      if (roller && roller.p === p) roller.p = null; if (stomp && stomp.p === p) stomp.p = null;
+      if (tool === 'Press' && performance.now() - p.t0 < 110) taps.push({ x: p.x, y: p.y, left: .11 }); // a quick tap still pushes the film in for a moment
+    },
     frame(dt) {
       slide *= Math.pow(.0009, dt); if (slide < .5) slide = 0;
-      for (const b of bubbles) b.press = false;
-      if (!slide) for (const p of P.values()) {
-        const steps = Math.max(1, Math.ceil(Math.hypot(p.x - p.px, p.y - p.py) / 10));
-        for (let s = 0; s <= steps; s++) {
-          const x = p.px + (p.x - p.px) * s / steps, y = p.py + (p.y - p.py) * s / steps;
-          for (const b of bubbles) if (!b.popped && (x - b.x) ** 2 + (y - b.y) ** 2 < b.r * b.r) b.press = true;
-        }
-      }
-      let left = 0;
-      for (const b of bubbles) {
-        if (b.popped) continue;
-        if (b.press) { b.s += dt * 14; if (b.s >= 1) pop(b); } else b.s = Math.max(0, b.s - dt * 7);
-        if (!b.popped) left++;
-      }
-      if (!left && bubbles.length && !nextAt) nextAt = performance.now() + 900;
+      step(dt);
+      let left = 0; for (const b of bubbles) if (!b.popped) left++;
+      if (!left && bubbles.length && !nextAt) { nextAt = performance.now() + 900; if (!cleared) { cleared = true; discover('bub', 'clean', 'Clean sheet', 'Every last bubble on the sheet, popped.'); } }
       if (nextAt && performance.now() > nextAt) init(true);
       if (dirty) { store.set('pops', total); dirty = false; }
       // draw
       ctx.fillStyle = '#0e1219'; ctx.fillRect(0, 0, W, H);
       ctx.save(); ctx.translate(slide, 0);
       const B = bounds();
-      const sheet = ctx.createLinearGradient(0, B.top, W, B.bottom);
-      sheet.addColorStop(0, '#1a2431'); sheet.addColorStop(.5, '#16202b'); sheet.addColorStop(1, '#1b2635');
-      ctx.fillStyle = sheet; ctx.fillRect(4, B.top, W - 8, B.bottom - B.top);
+      const sh = ctx.createLinearGradient(0, B.top, W, B.bottom);
+      sh.addColorStop(0, '#1a2431'); sh.addColorStop(.5, '#16202b'); sh.addColorStop(1, '#1b2635');
+      ctx.fillStyle = sh; ctx.fillRect(4, B.top, W - 8, B.bottom - B.top);
+      // channels and blown seals
+      ctx.lineCap = 'round';
+      for (const L of links) if (L.open) {
+        ctx.strokeStyle = L.chan ? 'rgba(170,205,245,.16)' : 'rgba(200,225,255,.1)'; ctx.lineWidth = L.chan ? L.a.r * .7 : 2;
+        ctx.beginPath(); ctx.moveTo(L.a.x, L.a.y); ctx.lineTo(L.b.x, L.b.y); ctx.stroke();
+      }
+      const hex = SHEETS[sheet].shape === 'hex', spr = sprite(hex ? 'hex' : 'round');
       for (const b of bubbles) {
         if (b.popped) {
           crinkle(b); ctx.fillStyle = 'rgba(255,255,255,.035)'; ctx.fill();
@@ -1166,23 +1594,40 @@ const Bub = (() => {
           ctx.beginPath(); ctx.moveTo(b.x - b.r * .4, b.y + Math.sin(b.seed) * b.r * .3); ctx.lineTo(b.x + b.r * .35, b.y + Math.cos(b.seed) * b.r * .25); ctx.stroke();
           continue;
         }
-        const k = 1 - .2 * b.s, r = b.r * k;
-        const gr = ctx.createRadialGradient(b.x - r * .35, b.y - r * .4, r * .05, b.x, b.y, r);
-        gr.addColorStop(0, 'rgba(255,255,255,.55)'); gr.addColorStop(.35, 'rgba(190,220,255,.2)'); gr.addColorStop(1, 'rgba(120,170,220,.16)');
-        ctx.fillStyle = gr; ctx.beginPath(); ctx.ellipse(b.x, b.y, r * (1 + .12 * b.s), r, 0, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = 'rgba(220,235,255,.3)'; ctx.lineWidth = 1.2; ctx.stroke();
-        ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.beginPath(); ctx.ellipse(b.x - r * .38, b.y - r * .42, r * .16, r * .09, -.6, 0, Math.PI * 2); ctx.fill();
+        const grow = Math.cbrt(Math.max(.2, b.m)), flat = 1 - .2 * b.s;
+        const rx = b.r * grow * flat * (1 + .15 * b.s), ry = b.r * grow * flat * (b.m < .8 ? .6 + .5 * b.m : 1);
+        const strain = clamp((b.p - 1) / (b.burstAt - 1), 0, 1);
+        ctx.drawImage(spr, b.x - rx, b.y - ry, rx * 2, ry * 2);
+        if (strain > .45) { ctx.fillStyle = `rgba(255,${200 - strain * 90 | 0},170,${(strain - .45) * .35})`; ctx.beginPath(); ctx.ellipse(b.x, b.y, rx * .9, ry * .9, 0, 0, Math.PI * 2); ctx.fill(); }
+      }
+      if (stomp) {
+        ctx.fillStyle = `rgba(20,24,32,${.55 * stomp.d})`; ctx.strokeStyle = `rgba(220,235,255,${.4 * stomp.d})`; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.ellipse(stomp.x, stomp.y, stomp.R * .7, stomp.R, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+      if (roller) {
+        const x0 = roller.x - roller.L / 2, R = roller.R;
+        const gr = ctx.createLinearGradient(0, roller.y - R, 0, roller.y + R);
+        gr.addColorStop(0, '#8d97a8'); gr.addColorStop(.35, '#e2e8f2'); gr.addColorStop(1, '#4a5160');
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(x0 + 4, roller.y + R * .6, roller.L, R * .6);
+        ctx.fillStyle = gr; ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x0, roller.y - R, roller.L, R * 2, R * .5) : ctx.rect(x0, roller.y - R, roller.L, R * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,.18)'; ctx.lineWidth = 2;
+        for (let k = 0; k < 6; k++) { const a = roller.spin + k * Math.PI / 3, s = Math.sin(a); if (Math.cos(a) < 0) continue; ctx.beginPath(); ctx.moveTo(x0 + 6, roller.y + s * R * .9); ctx.lineTo(x0 + roller.L - 6, roller.y + s * R * .9); ctx.stroke(); }
+        ctx.fillStyle = '#c9a36b'; ctx.fillRect(x0 - 16, roller.y - 5, 16, 10); ctx.fillRect(x0 + roller.L, roller.y - 5, 16, 10);
       }
       ctx.restore();
       for (const f of puffs) { f.x += f.vx * dt; f.y += f.vy * dt; f.life -= dt * 3; }
       puffs = puffs.filter(f => f.life > 0);
       for (const f of puffs) { ctx.fillStyle = `rgba(220,235,255,${f.life * .5})`; ctx.beginPath(); ctx.arc(f.x, f.y, 1.6, 0, Math.PI * 2); ctx.fill(); }
-      subEl.textContent = '';
+      tipT -= dt;
+      const live = performance.now() - comboT < 650 && combo > 1;
+      subEl.textContent = live ? `Combo ×${combo}` : tipT > 0 ? TIPS[tool] : `Best combo ×${best} · ${discovered('bub')}/11 discovered`;
     },
     chips() {
       return [
         { label: total.toLocaleString() + ' popped', stat: true },
-        { label: 'New sheet', act() { init(true); } }
+        { label: tool + ' ▾', act() { tool = TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]; tipT = 4; if (tool === 'Roller') roll0(null); else roller = null; stomp = null; } },
+        { label: SHEETS[sheet].name + ' ▾', act() { sheet = SKEYS[(SKEYS.indexOf(sheet) + 1) % SKEYS.length]; init(true); if (tool === 'Roller') roll0(null); } },
+        { label: 'New sheet', act() { init(true); if (tool === 'Roller') roll0(null); } }
       ];
     }
   };
