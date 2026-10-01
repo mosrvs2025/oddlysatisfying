@@ -479,15 +479,45 @@ const Fluid = (() => {
   const HDR = `#version 300 es
   precision highp float; precision highp sampler2D;
   in vec2 vUv, vL, vR, vT, vB; out vec4 o;\n`;
+  // placed emitters: xy = position, zw = jet direction (or vortex spin in z); uIc = rgb ink + kind (1 jet, 2 vortex, 3 heater, 4 drain)
+  const ITEMS = `uniform vec4 uIt[12]; uniform vec4 uIc[12]; uniform int uN; uniform float aspect;\n`;
   const SRC = {
-    splat: HDR + `uniform float aspect, radius; uniform vec3 color; uniform vec2 point;
-      void main(){ vec2 p=vUv-point; p.x*=aspect; o=vec4(exp(-dot(p,p)/radius)*color,0.); }`,
+    splat: HDR + `uniform float aspect, radius, heat; uniform vec3 color; uniform vec2 point;
+      void main(){ vec2 p=vUv-point; p.x*=aspect; float g=exp(-dot(p,p)/radius); o=vec4(g*color,g*heat); }`,
+    paint: HDR + `uniform float aspect, rad; uniform vec2 point; uniform float val;
+      void main(){ vec2 p=vUv-point; p.x*=aspect; float g=1.-smoothstep(rad*.55,rad,length(p)); o=vec4(val>0.?g:1.-g); }`,
+    forces: HDR + ITEMS + `uniform sampler2D uVelocity, uDye, uObst; uniform float dt, buoy;
+      void main(){
+        vec2 v=texture(uVelocity,vUv).xy; v.y+=buoy*texture(uDye,vUv).a*dt;
+        for(int i=0;i<12;i++){ if(i>=uN) break;
+          vec4 it=uIt[i]; float k=uIc[i].w; vec2 p=vUv-it.xy; p.x*=aspect; float r2=dot(p,p);
+          if(k==1.) v=mix(v,it.zw*240.,exp(-r2/.0006)*.35);
+          else if(k==2.){ float g=exp(-r2/.0064); v=mix(v,vec2(-p.y,p.x)*it.z*2200.,g*.18); }
+        }
+        v*=1.-smoothstep(.3,.6,texture(uObst,vUv).x); o=vec4(v,0.,1.); }`,
+    sources: HDR + ITEMS + `uniform sampler2D uDye, uObst; uniform float dt;
+      void main(){
+        vec4 d=texture(uDye,vUv); d.a/=1.+.12*dt;
+        for(int i=0;i<12;i++){ if(i>=uN) break;
+          vec4 it=uIt[i]; float k=uIc[i].w; vec2 p=vUv-it.xy; p.x*=aspect; float r2=dot(p,p);
+          if(k==1.) d.rgb+=uIc[i].rgb*exp(-r2/.0003)*dt*1.3;
+          else if(k==3.){ float g=exp(-r2/.0010); d.a+=g*dt*6.; d.rgb+=uIc[i].rgb*g*dt*1.; }
+          else if(k==4.) d*=1.-min(exp(-r2/.0005)*dt*7.,1.);
+        }
+        d*=1.-smoothstep(.3,.6,texture(uObst,vUv).x); d.a=clamp(d.a,-3.,3.); o=d; }`,
+    probe: HDR + `uniform sampler2D uVelocity, uDye, uObst;
+      void main(){ vec2 v=texture(uVelocity,vUv).xy; vec4 d=texture(uDye,vUv); float s=texture(uObst,vUv).x;
+        o=vec4(clamp(.5+v/600.,0.,1.),clamp(max(d.r,max(d.g,d.b))*.5,0.,1.),s>.5?1.:clamp(.5+d.a*.3,0.,.98)); }`,
     advect: HDR + `uniform sampler2D uVelocity, uSource; uniform vec2 simTexel; uniform float dt, dissipation;
       void main(){ vec2 c=vUv-dt*texture(uVelocity,vUv).xy*simTexel; o=texture(uSource,c)/(1.+dissipation*dt); }`,
-    divergence: HDR + `uniform sampler2D uVelocity;
+    divergence: HDR + ITEMS + `uniform sampler2D uVelocity, uObst; uniform float sink;
       void main(){ float L=texture(uVelocity,vL).x, R=texture(uVelocity,vR).x, T=texture(uVelocity,vT).y, B=texture(uVelocity,vB).y;
         vec2 C=texture(uVelocity,vUv).xy; if(vL.x<0.)L=-C.x; if(vR.x>1.)R=-C.x; if(vT.y>1.)T=-C.y; if(vB.y<0.)B=-C.y;
-        o=vec4(.5*(R-L+T-B),0.,0.,1.); }`,
+        if(texture(uObst,vL).x>.5)L=0.; if(texture(uObst,vR).x>.5)R=0.; if(texture(uObst,vT).x>.5)T=0.; if(texture(uObst,vB).x>.5)B=0.;
+        float d=.5*(R-L+T-B);
+        for(int i=0;i<12;i++){ if(i>=uN) break; if(uIc[i].w!=4.) continue; vec2 p=vUv-uIt[i].xy; p.x*=aspect; d+=sink*exp(-dot(p,p)/.0012); }
+        if(texture(uObst,vUv).x>.5) d=0.;
+        o=vec4(d,0.,0.,1.); }`,
     curl: HDR + `uniform sampler2D uVelocity;
       void main(){ float L=texture(uVelocity,vL).y, R=texture(uVelocity,vR).y, T=texture(uVelocity,vT).x, B=texture(uVelocity,vB).x;
         o=vec4(.5*(R-L-T+B),0.,0.,1.); }`,
@@ -495,12 +525,14 @@ const Fluid = (() => {
       void main(){ float L=texture(uCurl,vL).x, R=texture(uCurl,vR).x, T=texture(uCurl,vT).x, B=texture(uCurl,vB).x, C=texture(uCurl,vUv).x;
         vec2 f=.5*vec2(abs(T)-abs(B),abs(R)-abs(L)); f/=length(f)+.0001; f*=curl*C; f.y*=-1.;
         vec2 v=texture(uVelocity,vUv).xy+f*dt; o=vec4(clamp(v,-1000.,1000.),0.,1.); }`,
-    pressure: HDR + `uniform sampler2D uPressure, uDivergence;
-      void main(){ float L=texture(uPressure,vL).x, R=texture(uPressure,vR).x, T=texture(uPressure,vT).x, B=texture(uPressure,vB).x;
+    pressure: HDR + `uniform sampler2D uPressure, uDivergence, uObst;
+      void main(){ float L=texture(uPressure,vL).x, R=texture(uPressure,vR).x, T=texture(uPressure,vT).x, B=texture(uPressure,vB).x, C=texture(uPressure,vUv).x;
+        if(texture(uObst,vL).x>.5)L=C; if(texture(uObst,vR).x>.5)R=C; if(texture(uObst,vT).x>.5)T=C; if(texture(uObst,vB).x>.5)B=C;
         o=vec4((L+R+B+T-texture(uDivergence,vUv).x)*.25,0.,0.,1.); }`,
-    gradient: HDR + `uniform sampler2D uPressure, uVelocity;
-      void main(){ float L=texture(uPressure,vL).x, R=texture(uPressure,vR).x, T=texture(uPressure,vT).x, B=texture(uPressure,vB).x;
-        vec2 v=texture(uVelocity,vUv).xy-vec2(R-L,T-B); o=vec4(v,0.,1.); }`,
+    gradient: HDR + `uniform sampler2D uPressure, uVelocity, uObst;
+      void main(){ float L=texture(uPressure,vL).x, R=texture(uPressure,vR).x, T=texture(uPressure,vT).x, B=texture(uPressure,vB).x, C=texture(uPressure,vUv).x;
+        if(texture(uObst,vL).x>.5)L=C; if(texture(uObst,vR).x>.5)R=C; if(texture(uObst,vT).x>.5)T=C; if(texture(uObst,vB).x>.5)B=C;
+        vec2 v=texture(uVelocity,vUv).xy-vec2(R-L,T-B); o=vec4(v*(1.-smoothstep(.3,.6,texture(uObst,vUv).x)),0.,1.); }`,
     scale: HDR + `uniform sampler2D uTexture; uniform float value; void main(){ o=value*texture(uTexture,vUv); }`,
     pupdate: HDR + `uniform sampler2D uParticles, uVelocity; uniform vec2 simTexel; uniform float dt, time;
       float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -517,7 +549,7 @@ const Fluid = (() => {
         float br=max(c.r,max(c.g,c.b)); o=vec4(c*max(br-thr,0.)/max(br,1e-4),1.); }`,
     blur: HDR + `uniform sampler2D uTexture; uniform vec2 dir;
       void main(){ o=texture(uTexture,vUv)*.227+(texture(uTexture,vUv+dir*1.385)+texture(uTexture,vUv-dir*1.385))*.316+(texture(uTexture,vUv+dir*3.231)+texture(uTexture,vUv-dir*3.231))*.07; }`,
-    display: HDR + `uniform sampler2D uTexture, uTrail, uBloom; uniform float gloss, ink, spark, glow; uniform vec3 bg;
+    display: HDR + ITEMS + `uniform sampler2D uTexture, uTrail, uBloom, uObst; uniform float gloss, ink, spark, glow, time; uniform vec3 bg;
       void main(){
         vec3 c=texture(uTexture,vUv).rgb*ink;
         float l=length(texture(uTexture,vL).rgb), r=length(texture(uTexture,vR).rgb), t=length(texture(uTexture,vT).rgb), b=length(texture(uTexture,vB).rgb);
@@ -533,7 +565,26 @@ const Fluid = (() => {
         vec3 tr=(1.-exp(-texture(uTrail,vUv).rgb*1.6))*spark;
         vec3 bl=texture(uBloom,vUv).rgb*glow;
         float vig=1.-.35*length(vUv-.5);
-        o=vec4(bg*vig*(1.-a)+col+tr+bl,1.);
+        float T=texture(uTexture,vUv).a;
+        vec3 heat=vec3(1.,.42,.1)*smoothstep(0.,1.6,T)*.5+vec3(.3,.62,1.)*smoothstep(0.,1.6,-T)*.4;
+        vec3 outc=bg*vig*(1.-a)+col+tr+bl+heat*ink;
+        float s=texture(uObst,vUv).x, w=smoothstep(.35,.6,s);
+        if(w>0.){
+          float sx=texture(uObst,vR).x-texture(uObst,vL).x, sy=texture(uObst,vT).x-texture(uObst,vB).x;
+          vec3 stone=vec3(.19,.2,.26)*(1.+.25*sin(vUv.x*300.+sin(vUv.y*170.)*2.))+vec3(.55,.6,.72)*clamp(-sx*.8+sy*.8,0.,1.)-.12*clamp(sx*.8-sy*.8,0.,1.);
+          outc=mix(outc,stone,w);
+        }
+        for(int i=0;i<12;i++){ if(i>=uN) break;
+          vec4 it=uIt[i]; float k=uIc[i].w; vec2 p=vUv-it.xy; p.x*=aspect; float d=length(p);
+          float ring=smoothstep(.0035,0.,abs(d-.018));
+          vec3 ic=k==1.?uIc[i].rgb*1.4+.25:k==2.?vec3(.85,.9,1.):k==3.?vec3(1.,.55,.18):vec3(.5,.55,.7);
+          if(k==2.) ring*=.35+.65*step(0.,sin(atan(p.y,p.x)*3.-time*6.*it.z));
+          if(k==1.){ float along=dot(p,it.zw), side=abs(dot(p,vec2(-it.w,it.z))); ring=max(ring*.6,smoothstep(.003,0.,side)*step(0.,along)*step(along,.03)); }
+          if(k==3.) ring=max(ring,smoothstep(.012,0.,d)*(.55+.25*sin(time*5.)));
+          if(k==4.) outc*=mix(1.,.15,smoothstep(.016,.004,d));
+          outc=mix(outc,ic,clamp(ring,0.,1.)*.85);
+        }
+        o=vec4(outc,1.);
       }`
   };
   const PVS = `#version 300 es
@@ -611,15 +662,22 @@ const Fluid = (() => {
     { name: 'Candy', f: h => { const u = wave(h); return hsl(.52 + u * .45, .9, .66); } },
     { name: 'Ink', f: h => { const u = wave(h * 2); return hsl(.62, .35 + u * .5, .55 + u * .3); } }
   ];
-  const VIEWS = [{ name: 'Ink + sparks', ink: 1, spark: 1 }, { name: 'Ink', ink: 1, spark: 0 }, { name: 'Sparks', ink: 0, spark: 1.4 }];
+  const VIEWS = [{ name: 'Ink + sparks', ink: 1, spark: 1 }, { name: 'Ink', ink: 1, spark: 0 }, { name: 'Sparks', ink: 0, spark: 1.4 }, { name: 'Matte ink', ink: 1, spark: 0, matte: 1 }];
   const MIRRORS = [0, 2, 3, 4, 6];
-  let vel, dye, div, curl, pres, part, trail, bloomA, bloomB, PSIZE = 0, time = 0;
+  // what a touch does: stir ink (plain, hot or cold), build walls, place emitters, or erase
+  const TOOLS = [
+    { name: 'Stir', ink: 0 }, { name: 'Hot ink', ink: 1 }, { name: 'Cold ink', ink: -1 }, { name: 'Wall', wall: 1 },
+    { name: 'Jet', kind: 1 }, { name: 'Vortex', kind: 2 }, { name: 'Heater', kind: 3 }, { name: 'Drain', kind: 4 }, { name: 'Erase', erase: 1 }
+  ];
+  const MAXI = 12, itBuf = new Float32Array(MAXI * 4), icBuf = new Float32Array(MAXI * 4);
+  let items = [], walls = 0, toolI = 0, spinSign = 1;
+  let vel, dye, div, curl, pres, part, trail, bloomA, bloomB, obst, probe, PSIZE = 0, time = 0;
   let palI = store.get('fluidPal', 0) % palettes.length, gloss = store.get('gloss', true), hue = Math.random();
   let viewI = store.get('fluidView', 0) % VIEWS.length, mirI = 0;
   function build() {
     const s = Math.min(DPR, 1.5);
     glc.width = Math.floor(W * s); glc.height = Math.floor(H * s);
-    [vel, dye, div, curl, pres, part, trail, bloomA, bloomB].forEach(f => f && f.free());
+    [vel, dye, div, curl, pres, part, trail, bloomA, bloomB, obst, probe].forEach(f => f && f.free());
     const sr = res(cfg.sim), dr = res(small ? 640 : 1024), tr = res(small ? 420 : 640), br = res(small ? 160 : 256);
     gl.disable(gl.BLEND);
     vel = dfbo(sr.w, sr.h, fRG, gl.LINEAR);
@@ -631,14 +689,42 @@ const Fluid = (() => {
     part = dfbo(PSIZE, PSIZE, fP, gl.NEAREST);
     trail = dfbo(tr.w, tr.h, fRGBA, gl.LINEAR);
     bloomA = fbo(br.w, br.h, fRGBA, gl.LINEAR); bloomB = fbo(br.w, br.h, fRGBA, gl.LINEAR);
+    const orr = res(cfg.sim * 2); obst = fbo(orr.w, orr.h, fR, gl.LINEAR); walls = 0;
+    const pr = res(24); probe = fbo(pr.w, pr.h, { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE }, gl.NEAREST);
+    probeBuf = new Uint8Array(pr.w * pr.h * 4);
+  }
+  let probeBuf = null;
+  function setItems(u) {
+    const n = items.length;
+    for (let i = 0; i < n; i++) {
+      const it = items[i], j = i * 4;
+      itBuf[j] = it.x; itBuf[j + 1] = it.y; itBuf[j + 2] = it.k === 2 ? it.spin : it.dx; itBuf[j + 3] = it.dy;
+      icBuf[j] = it.c[0]; icBuf[j + 1] = it.c[1]; icBuf[j + 2] = it.c[2]; icBuf[j + 3] = it.k;
+    }
+    gl.uniform4fv(u['uIt[0]'] || null, itBuf); gl.uniform4fv(u['uIc[0]'] || null, icBuf);
+    gl.uniform1i(u.uN || null, n); gl.uniform1f(u.aspect || null, glc.width / glc.height);
+  }
+  // walls live in their own mask: painted with MAX, erased with MIN
+  function paint(x, y, on, radPx) {
+    const u = use('paint');
+    gl.uniform2f(u.texel, obst.tx, obst.ty); gl.uniform1f(u.aspect, glc.width / glc.height); gl.uniform2f(u.point, x, y);
+    gl.uniform1f(u.rad, radPx / H); gl.uniform1f(u.val, on ? 1 : 0);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.blendEquation(on ? gl.MAX : gl.MIN);
+    blit(obst);
+    gl.blendEquation(gl.FUNC_ADD); gl.disable(gl.BLEND);
+  }
+  function paintLine(ax, ay, bx, by, on) {
+    const d = Math.hypot(bx - ax, by - ay), n = Math.max(1, Math.ceil(d / 3));
+    for (let i = 1; i <= n; i++) { const t = i / n; paint((ax + (bx - ax) * t) / W, 1 - (ay + (by - ay) * t) / H, on, on ? 9 : 20); }
+    if (on) walls++;
   }
   // Splats are additive, so they blend straight into the live buffer inside a scissor box: cheap enough to mirror 12 ways.
-  function splat(x, y, dx, dy, col, rad) {
+  function splat(x, y, dx, dy, col, rad, heat) {
     const ar = glc.width / glc.height;
     let r = (rad || cfg.radius) / 100; if (ar > 1) r *= ar;
     const e = Math.sqrt(r * 7.5);
     const u = use('splat');
-    gl.uniform1f(u.aspect, ar); gl.uniform2f(u.point, x, y); gl.uniform1f(u.radius, r); gl.uniform2f(u.texel, vel.tx, vel.ty);
+    gl.uniform1f(u.aspect, ar); gl.uniform2f(u.point, x, y); gl.uniform1f(u.radius, r); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1f(u.heat, heat || 0);
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.enable(gl.SCISSOR_TEST);
     const into = (f, a, b, c) => {
       const x0 = clamp(Math.floor((x - e / ar) * f.w) - 1, 0, f.w), x1 = clamp(Math.ceil((x + e / ar) * f.w) + 1, 0, f.w);
@@ -650,16 +736,16 @@ const Fluid = (() => {
     into(dye.read, col[0], col[1], col[2]);
     gl.disable(gl.SCISSOR_TEST); gl.disable(gl.BLEND);
   }
-  function splatSym(x, y, dx, dy, col, rad) {
+  function splatSym(x, y, dx, dy, col, rad, heat) {
     const m = MIRRORS[mirI];
-    if (!m) return splat(x, y, dx, dy, col, rad);
+    if (!m) return splat(x, y, dx, dy, col, rad, heat);
     const ar = glc.width / glc.height, qx = (x - .5) * ar, qy = y - .5;
     const k = 1 / m;
     for (let i = 0; i < m; i++) {
       const a = i / m * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
       for (const f of [1, -1]) {
         const px = qx, py = qy * f, vx = dx, vy = dy * f;
-        splat((px * ca - py * sa) / ar + .5, px * sa + py * ca + .5, vx * ca - vy * sa, vx * sa + vy * ca, [col[0] * k, col[1] * k, col[2] * k], rad);
+        splat((px * ca - py * sa) / ar + .5, px * sa + py * ca + .5, vx * ca - vy * sa, vx * sa + vy * ca, [col[0] * k, col[1] * k, col[2] * k], rad, (heat || 0) * k);
       }
     }
   }
@@ -674,15 +760,20 @@ const Fluid = (() => {
     let u = use('curl'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uVelocity, vel.read.bind(0)); blit(curl);
     u = use('vorticity'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uCurl, curl.bind(1));
     gl.uniform1f(u.curl, cfg.curl); gl.uniform1f(u.dt, dt); blit(vel.write); vel.swap();
-    u = use('divergence'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uVelocity, vel.read.bind(0)); blit(div);
+    u = use('forces'); setItems(u); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uDye, dye.read.bind(1));
+    gl.uniform1i(u.uObst, obst.bind(2)); gl.uniform1f(u.dt, dt); gl.uniform1f(u.buoy, 190); blit(vel.write); vel.swap();
+    u = use('divergence'); setItems(u); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uObst, obst.bind(1));
+    gl.uniform1f(u.sink, 9); blit(div);
     u = use('scale'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uTexture, pres.read.bind(0)); gl.uniform1f(u.value, cfg.pressure); blit(pres.write); pres.swap();
-    u = use('pressure'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uDivergence, div.bind(0));
+    u = use('pressure'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uDivergence, div.bind(0)); gl.uniform1i(u.uObst, obst.bind(2));
     for (let i = 0; i < cfg.iters; i++) { gl.uniform1i(u.uPressure, pres.read.bind(1)); blit(pres.write); pres.swap(); }
-    u = use('gradient'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uPressure, pres.read.bind(0)); gl.uniform1i(u.uVelocity, vel.read.bind(1)); blit(vel.write); vel.swap();
+    u = use('gradient'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform1i(u.uPressure, pres.read.bind(0)); gl.uniform1i(u.uVelocity, vel.read.bind(1)); gl.uniform1i(u.uObst, obst.bind(2)); blit(vel.write); vel.swap();
     u = use('advect'); gl.uniform2f(u.texel, vel.tx, vel.ty); gl.uniform2f(u.simTexel, vel.tx, vel.ty);
     gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uSource, vel.read.bind(0)); gl.uniform1f(u.dt, dt); gl.uniform1f(u.dissipation, cfg.velDiss);
     blit(vel.write); vel.swap();
     gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uSource, dye.read.bind(1)); gl.uniform1f(u.dissipation, cfg.dyeDiss);
+    blit(dye.write); dye.swap();
+    u = use('sources'); setItems(u); gl.uniform2f(u.texel, dye.tx, dye.ty); gl.uniform1i(u.uDye, dye.read.bind(0)); gl.uniform1i(u.uObst, obst.bind(1)); gl.uniform1f(u.dt, dt);
     blit(dye.write); dye.swap();
     // tracer particles ride the same velocity field
     u = use('pupdate'); gl.uniform2f(u.texel, part.tx, part.ty); gl.uniform1i(u.uParticles, part.read.bind(0)); gl.uniform1i(u.uVelocity, vel.read.bind(1));
@@ -714,26 +805,137 @@ const Fluid = (() => {
   function render(v) {
     const u = use('display');
     gl.uniform2f(u.texel, dye.tx, dye.ty); gl.uniform1i(u.uTexture, dye.read.bind(0));
-    gl.uniform1i(u.uTrail, trail.read.bind(1)); gl.uniform1i(u.uBloom, bloomA.bind(2));
-    gl.uniform1f(u.gloss, gloss ? 1 : 0); gl.uniform1f(u.ink, v.ink); gl.uniform1f(u.spark, v.spark); gl.uniform1f(u.glow, .6);
+    gl.uniform1i(u.uTrail, trail.read.bind(1)); gl.uniform1i(u.uBloom, bloomA.bind(2)); gl.uniform1i(u.uObst, obst.bind(3));
+    setItems(u); gl.uniform1f(u.time, time % 1000);
+    gl.uniform1f(u.gloss, v.matte ? 0 : 1); gl.uniform1f(u.ink, v.ink); gl.uniform1f(u.spark, v.spark); gl.uniform1f(u.glow, .6);
     gl.uniform3f(u.bg, .035, .04, .065);
     blit(null);
+  }
+  // ---- placed things: jets, vortices, heaters, drains ----
+  const toUv = p => [p.x / W, 1 - p.y / H];
+  function nearItem(p, r) {
+    let best = null, bd = r || 30;
+    for (const it of items) { const d = Math.hypot(it.x * W - p.x, (1 - it.y) * H - p.y); if (d < bd) { bd = d; best = it; } }
+    return best;
+  }
+  function addItem(k, p) {
+    if (items.length >= MAXI) items.shift();
+    const [x, y] = toUv(p);
+    const c = k === 1 ? palettes[palI].f(hue + items.length * .29).map(v => v * .9) : k === 3 ? [.5, .32, .2] : [0, 0, 0];
+    const it = { k, x, y, dx: 0, dy: 1, spin: k === 2 ? (spinSign = -spinSign) : 0, c };
+    items.push(it); Snd.blorp(.6, k === 4 ? .6 : k === 3 ? .8 : 1.2);
+    return it;
+  }
+  function clearWalls() { bindTarget(obst); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); walls = 0; }
+  // ---- discoveries: a tiny readback of the flow, checked a few times a second ----
+  const D = { n: 0, wake: 0, peak: 0, stirred: false };
+  function analyse() {
+    const u = use('probe'); gl.uniform2f(u.texel, probe.tx, probe.ty);
+    gl.uniform1i(u.uVelocity, vel.read.bind(0)); gl.uniform1i(u.uDye, dye.read.bind(1)); gl.uniform1i(u.uObst, obst.bind(2));
+    blit(probe); gl.readPixels(0, 0, probe.w, probe.h, gl.RGBA, gl.UNSIGNED_BYTE, probeBuf);
+    const pw = probe.w, ph = probe.h, b = probeBuf;
+    const solid = (x, y) => x < 0 || y < 0 || x >= pw || y >= ph ? false : b[(y * pw + x) * 4 + 3] === 255;
+    const vx = (x, y) => (b[(y * pw + x) * 4] / 255 - .5) * 600, vy = (x, y) => (b[(y * pw + x) * 4 + 1] / 255 - .5) * 600;
+    let maxS = 0, dyeSum = 0, hotUp = 0, coldDown = 0, topT = 0, topN = 0, botT = 0, botN = 0, plume = false, sinkC = false, wp = 0, wn = 0, nearS = 0, nearN = 0;
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+      const i = (y * pw + x) * 4; if (b[i + 3] === 255) continue;
+      const X = vx(x, y), Y = vy(x, y), T = (b[i + 3] / 255 - .5) / .3, s = Math.hypot(X, Y), yy = (y + .5) / ph;
+      if (s > maxS) maxS = s; dyeSum += b[i + 2] / 127;
+      if (T > .15 && Y > 15) hotUp++; if (T < -.15 && Y < -15) coldDown++;
+      if (yy > .72 && T > .25 && Y > 25) plume = true;
+      if (yy < .28 && T < -.25 && Y < -20) sinkC = true;
+      if (yy > .67) { topT += T; topN++; } if (yy < .33) { botT += T; botN++; }
+      if (walls && x > 0 && y > 0 && x < pw - 1 && y < ph - 1) {
+        let near = false;
+        for (let j = -2; j <= 2 && !near; j++) for (let k = -2; k <= 2; k++) if (solid(x + k, y + j)) { near = true; break; }
+        if (near) {
+          const c = (vy(x + 1, y) - vy(x - 1, y) - vx(x, y + 1) + vx(x, y - 1)) / 2;
+          if (c > 14) wp++; if (c < -14) wn++; nearS += s; nearN++;
+        }
+      }
+    }
+    if (maxS > 200) D.stirred = true;
+    if (D.stirred && maxS < 4 && dyeSum > 25 && discover('fluid', 'calm', 'Dead calm', 'Every swirl finally spends itself. The ink just hangs there.')) D.stirred = false;
+    if (plume) discover('fluid', 'plume', 'Thermal', 'Hot water is lighter, so it climbs in a plume and mushrooms out at the top.');
+    if (sinkC) discover('fluid', 'downdraft', 'Downdraft', 'Cold water is heavier. It pours down through the rest like a slow waterfall.');
+    if (hotUp >= 3 && coldDown >= 3) discover('fluid', 'convection', 'Convection', 'Hot rising and cold sinking side by side: the engine behind weather.');
+    if (topN && botN && topT / topN > .2 && botT / botN < -.2 && maxS < 30) discover('fluid', 'inversion', 'Inversion layer', 'Warm water resting on cold. The layers refuse to mix.');
+    D.wake = walls && wp >= 2 && wn >= 2 && nearN && nearS / nearN > 18 ? D.wake + 1 : 0;
+    if (D.wake >= 4) discover('fluid', 'wake', 'Eddies', 'Flow tearing past a wall sheds swirls of both spins behind it.');
+    let drains = 0, feeds = 0;
+    for (const it of items) {
+      const cx = it.x * pw, cy = it.y * ph;
+      if (it.k === 1 && walls) {
+        for (let t = 1; t < 40; t += .5) {
+          const x = Math.floor(cx + it.dx * t), y = Math.floor(cy + it.dy * t);
+          if (x < 0 || y < 0 || x >= pw || y >= ph) break;
+          if (solid(x, y)) {
+            const bx = Math.floor(cx + it.dx * (t - 1.5)), by = Math.floor(cy + it.dy * (t - 1.5));
+            if (t > 2 && !solid(bx, by) && Math.hypot(vx(bx, by), vy(bx, by)) > 45) discover('fluid', 'deflect', 'Deflection', 'The jet slams into a wall and spreads along it.');
+            break;
+          }
+        }
+      }
+      if (it.k === 1 || it.k === 3) feeds++;
+      if (it.k === 4) {
+        drains++;
+        let tg = 0, rd = 0, n = 0;
+        for (let y = Math.floor(cy - 4); y <= cy + 4; y++) for (let x = Math.floor(cx - 4); x <= cx + 4; x++) {
+          if (x < 0 || y < 0 || x >= pw || y >= ph || solid(x, y)) continue;
+          const rx = x + .5 - cx, ry = y + .5 - cy, r = Math.hypot(rx, ry); if (r < 1.5 || r > 4) continue;
+          const X = vx(x, y), Y = vy(x, y); tg += Math.abs(-X * ry + Y * rx) / r; rd += (X * rx + Y * ry) / r; n++;
+        }
+        if (n && tg / n > 22 && rd / n < -4 && tg > Math.abs(rd)) discover('fluid', 'whirlpool', 'Whirlpool', 'Spin plus a sink: the water spirals in, faster the closer it gets.');
+      }
+    }
+    if (drains && !feeds) {
+      D.peak = Math.max(D.peak, dyeSum);
+      if (D.peak > 40 && dyeSum < D.peak * .2) discover('fluid', 'plughole', 'Down the plughole', 'The drain swallowed most of the ink in the tank.');
+    } else D.peak = 0;
   }
   let built = false;
   const mode = {
     ok: true, name: 'Fluid', canvas: 'gl',
-    hint: 'Drag to swirl. Hold still to make a fountain. More fingers, more currents.',
+    hint: 'Drag to swirl, hold still for a fountain. The first chip swaps in hot and cold ink, walls, jets, vortices, heaters and drains.',
     enter() { if (!built) { build(); scatter(6); built = true; } },
     resize() { if (built) { build(); scatter(5); } },
     down(p) {
+      const t = TOOLS[toolI]; p.tool = t;
+      if (t.kind) {
+        const n = nearItem(p);
+        if (n && n.k === t.kind) { p.item = n; p.grab = true; }
+        else { p.item = addItem(t.kind, p); p.grab = t.kind !== 1; }
+        return;
+      }
+      if (t.wall || t.erase) {
+        paintLine(p.x, p.y, p.x, p.y, !t.erase);
+        if (t.erase) { const n = nearItem(p, 36); if (n) { items.splice(items.indexOf(n), 1); Snd.blorp(.4, .5); } }
+        return;
+      }
       const c = palettes[palI].f(hue + p.n * .17);
-      splatSym(p.x / W, 1 - p.y / H, 0, 0, c.map(v => v * .35), cfg.radius * .6);
+      splatSym(p.x / W, 1 - p.y / H, 0, 0, c.map(v => v * .35), cfg.radius * .6, t.ink * .9);
     },
     frame(dt) {
       time += dt;
-      let moving = 0;
+      let moving = items.length * 6;
       const ar = W / H, now = performance.now();
       for (const p of P.values()) {
+        const t = p.tool || TOOLS[toolI];
+        if (t.kind) {
+          const it = p.item;
+          if (it && p.moved) {
+            if (p.grab) { it.x = p.x / W; it.y = 1 - p.y / H; }
+            else { const mx = p.x - it.x * W, my = (1 - it.y) * H - p.y, d = Math.hypot(mx, my); if (d > 10) { it.dx = mx / d; it.dy = my / d; } }
+          }
+          p.moved = false; continue;
+        }
+        if (t.wall || t.erase) {
+          if (p.moved) {
+            paintLine(p.px, p.py, p.x, p.y, !t.erase); moving += 30;
+            if (t.erase) { const n = nearItem(p, 36); if (n) items.splice(items.indexOf(n), 1); }
+          }
+          p.moved = false; continue;
+        }
         if (p.moved) {
           p.moved = false;
           const mx = p.x - p.px, my = p.y - p.py, dist = Math.hypot(mx, my);
@@ -743,35 +945,40 @@ const Fluid = (() => {
           moving += dist;
           hue += dist / 2600; // the color is a record of how far you've stirred
           const c = palettes[palI].f(hue + p.n * .17), k = .16 + Math.min(dist / 400, .25);
-          splatSym(p.x / W, 1 - p.y / H, dx * cfg.force, dy * cfg.force, [c[0] * k, c[1] * k, c[2] * k]);
+          splatSym(p.x / W, 1 - p.y / H, dx * cfg.force, dy * cfg.force, [c[0] * k, c[1] * k, c[2] * k], undefined, t.ink * 1.1);
           p.still = now;
         } else if (now - (p.still || p.t0) > 220) {
           // holding still turns your finger into a nozzle, pointing the way you last moved
           const hx = p.jx ?? 0, hy = p.jy ?? -1, jl = Math.hypot(hx, hy) || 1, jx = hx / jl, jy = hy / jl;
           let dx = jx * .016, dy = -jy * .016;
+          if (t.ink) dx = dy = 0; // hot and cold ink pour out gently and let the heat do the moving
           if (ar < 1) dx *= ar; if (ar > 1) dy /= ar;
           hue += dt * .08;
           const c = palettes[palI].f(hue + p.n * .17);
-          splatSym(p.x / W, 1 - p.y / H, dx * cfg.force, dy * cfg.force, c.map(v => v * .12), cfg.radius * .45);
+          splatSym(p.x / W, 1 - p.y / H, dx * cfg.force, dy * cfg.force, c.map(v => v * .12), cfg.radius * .45, t.ink * .5);
           moving += 12;
         }
       }
       Snd.hiss(Math.min(moving / 900, .16), 400 + Math.min(moving * 6, 1800));
       const v = VIEWS[viewI];
       step(Math.min(dt, 1 / 60));
+      if (++D.n % 12 === 0) analyse();
       sparks(v);
       bloom(v);
       render(v);
     },
     chips() {
       const m = MIRRORS[mirI];
-      return [
+      const list = [
+        { label: TOOLS[toolI].name, on: toolI > 0, act() { toolI = (toolI + 1) % TOOLS.length; } },
         { label: palettes[palI].name, act() { palI = (palI + 1) % palettes.length; store.set('fluidPal', palI); } },
         { label: VIEWS[viewI].name, act() { viewI = (viewI + 1) % VIEWS.length; store.set('fluidView', viewI); } },
         { label: m ? 'Mirror ×' + m : 'Mirror', on: !!m, act() { mirI = (mirI + 1) % MIRRORS.length; } },
-        { label: 'Gloss', on: gloss, act() { gloss = !gloss; store.set('gloss', gloss); } },
-        { label: 'Drain', act() { for (const f of [dye, trail]) { const u = use('scale'); gl.uniform2f(u.texel, f.tx, f.ty); gl.uniform1i(u.uTexture, f.read.bind(0)); gl.uniform1f(u.value, .25); blit(f.write); f.swap(); } } }
+        { label: 'Wash', act() { for (const f of [dye, trail]) { const u = use('scale'); gl.uniform2f(u.texel, f.tx, f.ty); gl.uniform1i(u.uTexture, f.read.bind(0)); gl.uniform1f(u.value, .25); blit(f.write); f.swap(); } } }
       ];
+      if (items.length || walls) list.push({ label: 'Clear build', act() { items = []; clearWalls(); } });
+      list.push({ label: 'Found ' + discovered('fluid') + '/9', stat: true });
+      return list;
     }
   };
   return mode;
@@ -1196,97 +1403,235 @@ const Lava = (() => {
     { name: 'Toxic', wax: [130, 245, 60], hot: [240, 255, 170], liq: [16, 38, 34] },
     { name: 'Sunset', wax: [255, 70, 150], hot: [255, 215, 120], liq: [34, 18, 58] }
   ];
-  const HEATS = [{ name: 'Low heat', h: .7 }, { name: 'Medium heat', h: 1.05 }, { name: 'High heat', h: 1.5 }];
-  let ps = [], lamp = null, palI = store.get('lavaPal', 0) % PALS.length, heatI = 1, oc, octx, img, FW, FH, SC = 4, R = 20, warm = 0;
-  function init() {
+  // wax types: melt is the temperature where the wax turns lighter than the liquid, coh how hard it clings to itself
+  const WAX = [
+    { name: 'House wax', melt: .55, coh: 22 },
+    { name: 'Heavy wax', melt: .92, coh: 24, wax: [52, 96, 255], hot: [150, 210, 255] },
+    { name: 'Light wax', melt: .36, coh: 17, wax: [40, 215, 160], hot: [200, 255, 230] },
+    { name: 'Sticky wax', melt: .62, coh: 44, wax: [228, 222, 238], hot: [255, 250, 232] }
+  ];
+  const HEATS = [{ name: 'Bulb off', h: 0 }, { name: 'Bulb low', h: .7 }, { name: 'Bulb med', h: 1.05 }, { name: 'Bulb high', h: 1.5 }];
+  const CAPS = [{ name: 'Cap', c: .35 }, { name: 'Cold cap', c: 1.2 }, { name: 'Warm cap', c: 0 }];
+  const SHAPES = [
+    { name: 'Rocket', f: d => .78 + .22 * Math.sin(Math.PI * d) - .12 * (1 - d) },
+    { name: 'Column', f: () => .74 },
+    { name: 'Hourglass', f: d => .3 + .7 * Math.pow(Math.abs(2 * d - 1), .75) },
+    { name: 'Globe', f: d => Math.max(.3, Math.sqrt(Math.max(0, 1 - (2 * d - 1) ** 2))) }
+  ];
+  const TOOLS = ['Warm', 'Chill', 'Stir', 'Pour', 'Scoop', 'Heater', 'Shake'];
+  const MAXN = 84;
+  const px = new Float32Array(MAXN), py = new Float32Array(MAXN), pr = new Float32Array(MAXN), pg = new Float32Array(MAXN), pb = new Float32Array(MAXN);
+  const par = new Int16Array(MAXN);
+  let ps = [], lamp = null, heaters = [], palI = store.get('lavaPal', 0) % PALS.length, heatI = 2, capI = 0, shapeI = 0, toolI = 0, waxI = 1;
+  let oc, octx, img, FW, FH, SC = 4, R = 20, warm = 0, shakeX = 0, shakeV = 0, compN = 0, frameN = 0, nextId = 1;
+  const hw = d => lamp.w / 2 * SHAPES[shapeI].f(clamp(d, 0, 1));
+  function mk(x, y, k, T) { return { x, y, vx: 0, vy: 0, T, k, c: 0, side: 0, hov: 0 }; }
+  function init(keep) {
     const B = bounds();
     const lw = Math.round(Math.min(W * .64, 330)), top = B.top + 46, bot = B.bottom - 58;
-    lamp = { x0: Math.round((W - lw) / 2), x1: Math.round((W + lw) / 2), y0: top, y1: bot, w: lw, h: bot - top };
+    lamp = { cx: W / 2, x0: Math.round((W - lw) / 2), x1: Math.round((W + lw) / 2), y0: top, y1: bot, w: lw, h: bot - top };
     R = lw * .085;
     FW = Math.ceil(lw / SC); FH = Math.ceil(lamp.h / SC);
     oc = document.createElement('canvas'); oc.width = FW; oc.height = FH; octx = oc.getContext('2d');
     img = octx.createImageData(FW, FH);
-    ps = [];
+    if (keep) return;
+    ps = []; heaters = [];
     const n = 30;
-    for (let i = 0; i < n; i++) ps.push({ x: rand(lamp.x0 + R, lamp.x1 - R), y: lamp.y1 - rand(R, lamp.h * .35), vx: 0, vy: 0, T: rand(0, .6) });
+    for (let i = 0; i < n; i++) { const y = lamp.y1 - rand(R, lamp.h * .35), m = hw((y - top) / lamp.h) - R; ps.push(mk(lamp.cx + rand(-m, m), y, 0, rand(0, .6))); }
     // a warm clump already on its way up, so the lamp looks alive on the first frame
-    for (let i = 0; i < 6; i++) ps[i] = { x: W / 2 + rand(-R, R), y: lamp.y0 + lamp.h * .45 + rand(-R, R), vx: 0, vy: -20, T: 1.1 };
+    for (let i = 0; i < 6; i++) { ps[i] = mk(W / 2 + rand(-R, R), lamp.y0 + lamp.h * .45 + rand(-R, R), 0, 1.1); ps[i].vy = -20; }
   }
+  function inLamp(x, y) { const d = (y - lamp.y0) / lamp.h; return d > 0 && d < 1 && Math.abs(x - lamp.cx) < hw(d); }
   function step(h) {
-    const L = lamp, heat = HEATS[heatI].h;
+    const L = lamp, heat = HEATS[heatI].h, cap = CAPS[capI].c;
     for (const p of ps) {
       const depth = (p.y - L.y0) / L.h;
       if (depth > .86) p.T += heat * 1.25 * h * (depth - .86) / .14;          // the bulb heats the bottom
       p.T += (.15 - p.T) * .09 * h;                                            // the room slowly cools everything
-      if (depth < .2) p.T -= .35 * h * (.2 - depth) / .2;                      // the cap is coldest
-      for (const q of P.values()) { const d = Math.hypot(p.x - q.x, p.y - q.y); if (d < 80) p.T += 1.8 * h * (1 - d / 80); }
+      if (depth < .2) p.T -= cap * h * (.2 - depth) / .2;                      // the cap is coldest
+      p.side *= Math.pow(.6, h);
+      for (const q of heaters) { const d = Math.hypot(p.x - q.x, p.y - q.y); if (d < 70) { const e = 1.7 * h * (1 - d / 70); p.T += e; p.side += e; } }
+      for (const q of P.values()) {
+        const tool = q.tool ?? toolI;
+        if (tool > 2) continue;
+        const d = Math.hypot(p.x - q.x, p.y - q.y);
+        if (tool === 0 && d < 80) p.T += 1.8 * h * (1 - d / 80);
+        else if (tool === 1 && d < 80) p.T -= 2.2 * h * (1 - d / 80);
+        else if (tool === 2 && d < 64) { const k = Math.min(1, 14 * h) * (1 - d / 64); p.vx += ((q.svx || 0) - p.vx) * k; p.vy += ((q.svy || 0) - p.vy) * k; }
+      }
       p.T = clamp(p.T, 0, 1.8);
-      p.vy -= 260 * (p.T - .55) * h;                                           // warm wax is lighter than the liquid
+      p.vy -= 260 * (p.T - WAX[p.k].melt) * h;                                 // warm wax is lighter than the liquid
     }
-    const hh = R * 1.35, reach = R * 2.6;
-    for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) {
+    const hh = R * 1.35, reach = R * 2.6, n = ps.length;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
       const a = ps[i], b = ps[j], dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy;
       if (d2 > reach * reach) continue;
-      const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d;
-      const f = d < hh ? -(hh - d) * 90 : (d - hh) * 22 * (1 - (d - hh) / (reach - hh)); // pushes apart up close, clings a little further out
+      const d = Math.sqrt(d2) || .01, nx = dx / d, ny = dy / d, same = a.k === b.k;
+      // molten wax clings less, so a hot blob can stretch until it tears; different waxes never mix, they only push
+      let f;
+      if (d < hh) f = -(hh - d) * 90;
+      else if (same) {
+        const ma = clamp((a.T - WAX[a.k].melt + .1) / .5, 0, 1), mb = clamp((b.T - WAX[b.k].melt + .1) / .5, 0, 1);
+        f = (d - hh) * WAX[a.k].coh * (1.25 - .55 * Math.max(ma, mb)) * (1 - (d - hh) / (reach - hh));
+      } else f = 0;
       a.vx += nx * f * h; a.vy += ny * f * h; b.vx -= nx * f * h; b.vy -= ny * f * h;
-      const vx = (b.vx - a.vx) * 1.6 * h, vy = (b.vy - a.vy) * 1.6 * h;       // viscosity
+      const vk = same ? 1.6 : .5, vx = (b.vx - a.vx) * vk * h, vy = (b.vy - a.vy) * vk * h;   // viscosity
       a.vx += vx; a.vy += vy; b.vx -= vx; b.vy -= vy;
       const dT = (b.T - a.T) * .8 * h; a.T += dT; b.T -= dT;                   // touching wax shares heat
     }
+    const m = R * .7, damp = Math.pow(.1, h);
     for (const p of ps) {
-      p.vx *= Math.pow(.1, h); p.vy *= Math.pow(.1, h);
+      p.vx *= damp; p.vy *= damp;
       p.x += p.vx * h; p.y += p.vy * h;
-      const m = R * .7;
-      if (p.x < L.x0 + m) { p.x = L.x0 + m; p.vx *= -.2; } if (p.x > L.x1 - m) { p.x = L.x1 - m; p.vx *= -.2; }
       if (p.y < L.y0 + m) { p.y = L.y0 + m; p.vy *= -.1; } if (p.y > L.y1 - m * .6) { p.y = L.y1 - m * .6; p.vy *= -.1; }
+      const lim = Math.max(2, hw((p.y - L.y0) / L.h) - m);
+      if (p.x < L.cx - lim) { p.x = L.cx - lim; p.vx *= -.2; } if (p.x > L.cx + lim) { p.x = L.cx + lim; p.vx *= -.2; }
     }
   }
   function field() {
     const pal = PALS[palI], d = img.data, L = lamp, n = ps.length;
-    const px = new Float32Array(n), py = new Float32Array(n), pt = new Float32Array(n);
-    for (let k = 0; k < n; k++) { px[k] = (ps[k].x - L.x0) / SC; py[k] = (ps[k].y - L.y0) / SC; pt[k] = ps[k].T; }
-    const rr = (R * 2.1 / SC) ** 2;
+    for (let k = 0; k < n; k++) {
+      const p = ps[k], w = WAX[p.k], c0 = w.wax || pal.wax, c1 = w.hot || pal.hot, hot = clamp((p.T - w.melt + .65) / 1.3, 0, 1);
+      px[k] = (p.x - L.x0) / SC; py[k] = (p.y - L.y0) / SC;
+      pr[k] = c0[0] + (c1[0] - c0[0]) * hot; pg[k] = c0[1] + (c1[1] - c0[1]) * hot; pb[k] = c0[2] + (c1[2] - c0[2]) * hot;
+    }
+    const rr = (R * 2.1 / SC) ** 2, r1 = R * 2.1 / SC;
     let i = 0;
     for (let y = 0; y < FH; y++) {
       const gy = y / FH;
       const lr = pal.liq[0] * (1.25 - gy * .5), lg = pal.liq[1] * (1.25 - gy * .5), lb = pal.liq[2] * (1.25 - gy * .5);
       const bulb = Math.max(0, (gy - .8) / .2) ** 2 * HEATS[heatI].h * .5;
+      // only the particles that can reach this row
+      let cnt = 0;
+      for (let k = 0; k < n; k++) if (Math.abs(y - py[k]) < r1) par[cnt++] = k;
       for (let x = 0; x < FW; x++, i += 4) {
-        let s = 0, ts = 0;
-        for (let k = 0; k < n; k++) { const dx = x - px[k], dy = y - py[k], q = 1 - (dx * dx + dy * dy) / rr; if (q > 0) { const v = q * q; s += v; ts += v * pt[k]; } }
-        const T = ts / (s || 1), a = clamp((s - .42) / .16, 0, 1), core = 1 - Math.exp(-Math.max(0, s - .5) * 1.2);
-        const hot = clamp(T / 1.3, 0, 1), sh = .7 + .45 * core;
-        const wr = (pal.wax[0] + (pal.hot[0] - pal.wax[0]) * hot) * sh, wg = (pal.wax[1] + (pal.hot[1] - pal.wax[1]) * hot) * sh, wb = (pal.wax[2] + (pal.hot[2] - pal.wax[2]) * hot) * sh;
-        const glow = Math.min(s, 1.2) * .12;
-        d[i] = lr + (wr - lr) * a + glow * pal.wax[0] * .35 + bulb * 255;
-        d[i + 1] = lg + (wg - lg) * a + glow * pal.wax[1] * .35 + bulb * 170;
-        d[i + 2] = lb + (wb - lb) * a + glow * pal.wax[2] * .35 + bulb * 60;
+        let s = 0, cr = 0, cg = 0, cb = 0;
+        for (let j = 0; j < cnt; j++) { const k = par[j], dx = x - px[k], dy = y - py[k], q = 1 - (dx * dx + dy * dy) / rr; if (q > 0) { const v = q * q; s += v; cr += v * pr[k]; cg += v * pg[k]; cb += v * pb[k]; } }
+        const inv = 1 / (s || 1), a = clamp((s - .42) / .16, 0, 1), core = 1 - Math.exp(-Math.max(0, s - .5) * 1.2), sh = .7 + .45 * core;
+        const wr = cr * inv * sh, wg = cg * inv * sh, wb = cb * inv * sh, glow = Math.min(s, 1.2) * .12 * .35;
+        d[i] = lr + (wr - lr) * a + glow * cr * inv + bulb * 255;
+        d[i + 1] = lg + (wg - lg) * a + glow * cg * inv + bulb * 170;
+        d[i + 2] = lb + (wb - lb) * a + glow * cb * inv + bulb * 60;
         d[i + 3] = 255;
       }
     }
     octx.putImageData(img, 0, 0);
   }
   function lampPath() {
-    const L = lamp, r = L.w * .18;
+    const L = lamp, N = 28;
     ctx.beginPath();
-    ctx.moveTo(L.x0 + r * .2, L.y0); ctx.lineTo(L.x1 - r * .2, L.y0);
-    ctx.quadraticCurveTo(L.x1 + 2, L.y0 + L.h * .5, L.x1 - r * .2, L.y1);
-    ctx.lineTo(L.x0 + r * .2, L.y1);
-    ctx.quadraticCurveTo(L.x0 - 2, L.y0 + L.h * .5, L.x0 + r * .2, L.y0);
+    for (let i = 0; i <= N; i++) { const d = i / N; ctx.lineTo(L.cx + hw(d), L.y0 + d * L.h); }
+    for (let i = N; i >= 0; i--) { const d = i / N; ctx.lineTo(L.cx - hw(d), L.y0 + d * L.h); }
     ctx.closePath();
+  }
+  // ---- blobs: particles of one wax that touch form a blob; watching blobs appear and vanish tells us about splits and merges ----
+  const root = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  const D = { ceil: 0, hover: 0 };
+  function blobs(dt) {
+    const n = ps.length, link = (R * 2.5) ** 2;
+    for (let i = 0; i < n; i++) par[i] = i;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const a = ps[i], b = ps[j]; if (a.k !== b.k) continue;
+      const dx = a.x - b.x, dy = a.y - b.y; if (dx * dx + dy * dy < link) { const ra = root(i), rb = root(j); if (ra !== rb) par[ra] = rb; }
+    }
+    // gather blobs: id, size, centroid, mean velocity, mean side heat, and where their particles were last time
+    const G = new Map();
+    for (let i = 0; i < n; i++) {
+      const r = root(i), p = ps[i];
+      let g = G.get(r); if (!g) { g = { n: 0, x: 0, y: 0, vy: 0, side: 0, prev: new Map() }; G.set(r, g); }
+      g.n++; g.x += p.x; g.y += p.y; g.vy += p.vy; g.side += p.side;
+      g.prev.set(p.c, (g.prev.get(p.c) || 0) + 1);
+    }
+    const from = new Map(); // previous blob -> how many sizeable new blobs it ended up in
+    let id = nextId; nextId += G.size + 1;
+    let hovering = false;
+    for (const [r, g] of G) {
+      g.x /= g.n; g.y /= g.n; g.vy /= g.n; g.side /= g.n; g.id = id++;
+      const depth = (g.y - lamp.y0) / lamp.h;
+      if (g.n >= 3) for (const [pc, c] of g.prev) if (pc && c >= 3) { const e = from.get(pc) || { n: 0, depth: 0 }; e.n++; e.depth = depth; from.set(pc, e); }
+      let olds = 0; for (const [pc, c] of g.prev) if (pc && c >= 3) olds++;
+      if (olds >= 2) { discover('lava', 'merge', 'Coalescence', 'Two blobs touched and fused into one.'); Snd.blorp(.35, .7); }
+      if (g.n >= 4 && depth > .3 && depth < .7 && Math.abs(g.vy) < 6) hovering = true;
+      if (g.n >= 3 && g.vy < -25 && depth < .75 && g.side > .02) discover('lava', 'side', 'Side thermal', 'Your heater, not the bulb, sent that blob climbing.');
+    }
+    for (const [, e] of from) if (e.n >= 2) {
+      discover('lava', 'split', 'Mitosis', 'A blob stretched too far tears in two.'); Snd.blorp(.3, 1.3);
+      if (SHAPES[shapeI].name === 'Hourglass' && e.depth > .3 && e.depth < .7) discover('lava', 'pinch', 'Pinch-off', 'The narrow waist squeezed a rising blob until it snapped.');
+    }
+    for (let i = 0; i < n; i++) ps[i].c = G.get(root(i)).id;
+    compN = G.size;
+    D.hover = hovering ? D.hover + dt : 0;
+    if (D.hover > 3) discover('lava', 'hover', 'Neutral buoyancy', 'Exactly as heavy as the liquid around it, the blob just floats mid-lamp.');
+    if (compN >= 9 && n >= 20) discover('lava', 'emulsion', 'Emulsion', 'Shaken hard, the wax breaks into a cloud of droplets.');
+    // whole-lamp states
+    let top = 0, cold = true, low = true, sp = 0;
+    const byT = WAX.map(() => ({ n: 0, y: 0 }));
+    for (const p of ps) {
+      const d = (p.y - lamp.y0) / lamp.h;
+      if (d < .3) top++; if (p.T > WAX[p.k].melt - .15) cold = false; if (d < .55) low = false;
+      sp += Math.abs(p.vx) + Math.abs(p.vy); byT[p.k].n++; byT[p.k].y += d;
+    }
+    sp /= n || 1;
+    D.ceil = n >= 10 && top >= n * .6 ? D.ceil + dt : 0;
+    if (D.ceil > 2) discover('lava', 'ceiling', 'Ceiling pool', 'The wax rises faster than the cap can cool it, and pools at the top.');
+    if (n >= 10 && heatI === 0 && cold && low) discover('lava', 'cold', 'Cold lamp', 'With the bulb off the wax cools, sinks and sets into a puddle.');
+    const layers = byT.map((t, k) => ({ k, n: t.n, y: t.y / (t.n || 1) })).filter(t => t.n >= 3).sort((a, b) => WAX[a.k].melt - WAX[b.k].melt);
+    if (layers.length >= 2 && sp < 12) {
+      let ok = true;
+      for (let i = 1; i < layers.length; i++) if (layers[i].y - layers[i - 1].y < R * 1.2 / lamp.h) ok = false;
+      if (ok) discover('lava', 'strata', 'Strata', 'Each wax settles at its own depth, lightest on top.');
+    }
+  }
+  function down(p) {
+    p.tool = toolI; const t = TOOLS[toolI];
+    if (t === 'Pour') pour(p, 4);
+    else if (t === 'Scoop') scoop(p);
+    else if (t === 'Heater' && inLamp(p.x, p.y)) {
+      const i = heaters.findIndex(q => Math.hypot(q.x - p.x, q.y - p.y) < 30);
+      if (i >= 0) heaters.splice(i, 1); else { if (heaters.length >= 3) heaters.shift(); heaters.push({ x: p.x, y: p.y }); }
+      Snd.blorp(.5, .8);
+    }
+    p.dist = 0; p.svx = 0; p.svy = 0; p.lvx = 0;
+  }
+  function pour(p, k) {
+    if (!inLamp(p.x, p.y)) return;
+    for (let i = 0; i < k && ps.length < MAXN; i++) ps.push(mk(p.x + rand(-R * .6, R * .6), p.y + rand(-R * .6, R * .6), waxI, WAX[waxI].melt));
+    Snd.blorp(.4, 1.1);
+  }
+  function scoop(p) {
+    const before = ps.length;
+    ps = ps.filter(q => Math.hypot(q.x - p.x, q.y - p.y) > R * 1.2);
+    if (ps.length < before) Snd.blorp(.3, .6);
   }
   let acc = 0;
   return {
-    name: 'Lava lamp', canvas: '2d', hint: 'Touch the lamp to warm the wax. Hot wax rises, cools at the top and sinks.',
+    name: 'Lava lamp', canvas: '2d', hint: 'Touch the lamp to warm the wax. The first chip swaps your hand for cold, stirring, pouring new wax, a heater or a shake.',
     enter() { if (!lamp) init(); },
-    resize() { init(); },
+    resize() { init(true); },
+    down,
     frame(dt) {
       if (!lamp) init();
+      for (const p of P.values()) {
+        const t = TOOLS[p.tool ?? toolI], vx = (p.x - p.px) / Math.max(dt, .001), vy = (p.y - p.py) / Math.max(dt, .001);
+        p.svx = (p.svx || 0) * .5 + vx * .5; p.svy = (p.svy || 0) * .5 + vy * .5;
+        if (t === 'Pour') { p.dist = (p.dist || 0) + Math.hypot(p.x - p.px, p.y - p.py); if (p.dist > R * 1.4) { p.dist = 0; pour(p, 2); } }
+        else if (t === 'Scoop' && p.moved) scoop(p);
+        else if (t === 'Shake') {
+          // the liquid lags the glass: every jerk of the lamp throws the wax the other way
+          const ax = (vx - (p.lvx || 0)), ay = vy;
+          p.lvx = vx;
+          shakeV += vx * .004;
+          const k = clamp(Math.abs(ax) * .06, 0, 520);
+          for (const q of ps) { q.vx -= Math.sign(ax) * k * .5 + rand(-1, 1) * k; q.vy += rand(-1, 1) * k - ay * .02; }
+        }
+        p.moved = false;
+      }
+      shakeV += -shakeX * 120 * dt; shakeV *= Math.pow(.02, dt); shakeX = clamp(shakeX + shakeV * dt * 60, -24, 24);
       acc = Math.min(acc + dt, .1); const h = 1 / 120;
       while (acc >= h) { step(h); acc -= h; }
+      if (++frameN % 4 === 0) blobs(dt * 4);
       field();
-      let avgT = 0; for (const p of ps) avgT += p.T; avgT /= ps.length;
+      let avgT = 0; for (const p of ps) avgT += p.T; avgT /= ps.length || 1;
       warm += (avgT - warm) * .05;
       const L = lamp, pal = PALS[palI];
       ctx.fillStyle = '#08070b'; ctx.fillRect(0, 0, W, H);
@@ -1294,14 +1639,21 @@ const Lava = (() => {
       const halo = ctx.createRadialGradient(W / 2, L.y0 + L.h * .55, 10, W / 2, L.y0 + L.h * .55, Math.max(W, H) * .7);
       halo.addColorStop(0, `rgba(${pal.wax.join(',')},${.1 + warm * .16})`); halo.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = halo; ctx.fillRect(0, 0, W, H);
+      ctx.save(); ctx.translate(shakeX, 0);
       ctx.save(); lampPath(); ctx.clip();
       ctx.imageSmoothingEnabled = true; ctx.drawImage(oc, L.x0, L.y0, FW * SC, FH * SC);
+      for (const q of heaters) {
+        const g = ctx.createRadialGradient(q.x, q.y, 2, q.x, q.y, 34);
+        g.addColorStop(0, 'rgba(255,220,140,.75)'); g.addColorStop(.3, 'rgba(255,120,40,.3)'); g.addColorStop(1, 'rgba(255,80,20,0)');
+        ctx.fillStyle = g; ctx.fillRect(q.x - 34, q.y - 34, 68, 68);
+      }
       const gl1 = ctx.createLinearGradient(L.x0, 0, L.x1, 0);
       gl1.addColorStop(0, 'rgba(255,255,255,.0)'); gl1.addColorStop(.12, 'rgba(255,255,255,.16)'); gl1.addColorStop(.2, 'rgba(255,255,255,0)');
       gl1.addColorStop(.82, 'rgba(255,255,255,0)'); gl1.addColorStop(.9, 'rgba(255,255,255,.07)'); gl1.addColorStop(1, 'rgba(0,0,0,.35)');
       ctx.fillStyle = gl1; ctx.fillRect(L.x0 - 4, L.y0, L.w + 8, L.h);
       ctx.restore();
       lampPath(); ctx.strokeStyle = 'rgba(255,255,255,.2)'; ctx.lineWidth = 1.5; ctx.stroke();
+      for (const q of heaters) { ctx.beginPath(); ctx.arc(q.x, q.y, 7, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(255,200,120,.8)'; ctx.stroke(); }
       // cap and base
       const metal = (y0, y1, wTop, wBot) => {
         const g = ctx.createLinearGradient(W / 2 - wBot / 2, 0, W / 2 + wBot / 2, 0);
@@ -1309,16 +1661,26 @@ const Lava = (() => {
         ctx.fillStyle = g; ctx.beginPath();
         ctx.moveTo(W / 2 - wTop / 2, y0); ctx.lineTo(W / 2 + wTop / 2, y0); ctx.lineTo(W / 2 + wBot / 2, y1); ctx.lineTo(W / 2 - wBot / 2, y1); ctx.closePath(); ctx.fill();
       };
-      metal(L.y0 - 40, L.y0 + 1, L.w * .34, L.w * .98);
-      metal(L.y1 - 1, L.y1 + 52, L.w * .98, L.w * .62);
-      ctx.fillStyle = `rgba(255,190,90,${.25 + HEATS[heatI].h * .25})`;
-      ctx.fillRect(W / 2 - L.w * .3, L.y1 + 6, L.w * .6, 2);
+      const wt = hw(0) * 2 + 6, wb = hw(1) * 2 + 6;
+      metal(L.y0 - 40, L.y0 + 1, wt * .35, wt);
+      if (capI === 1) { ctx.fillStyle = 'rgba(150,210,255,.35)'; ctx.fillRect(W / 2 - wt * .4, L.y0 - 22, wt * .8, 3); }
+      if (capI === 2) { ctx.fillStyle = 'rgba(255,170,90,.3)'; ctx.fillRect(W / 2 - wt * .4, L.y0 - 22, wt * .8, 3); }
+      metal(L.y1 - 1, L.y1 + 52, wb, wb * .64);
+      ctx.fillStyle = `rgba(255,190,90,${HEATS[heatI].h ? .25 + HEATS[heatI].h * .25 : .05})`;
+      ctx.fillRect(W / 2 - wb * .3, L.y1 + 6, wb * .6, 2);
+      ctx.restore();
     },
     chips() {
+      const t = TOOLS[toolI];
       return [
-        { label: PALS[palI].name, act() { palI = (palI + 1) % PALS.length; store.set('lavaPal', palI); } },
+        { label: t, on: toolI > 0, act() { toolI = (toolI + 1) % TOOLS.length; } },
+        { label: WAX[waxI].name, on: t === 'Pour', act() { waxI = (waxI + 1) % WAX.length; toolI = TOOLS.indexOf('Pour'); } },
         { label: HEATS[heatI].name, act() { heatI = (heatI + 1) % HEATS.length; } },
-        { label: 'Reset', act() { init(); } }
+        { label: CAPS[capI].name, on: capI > 0, act() { capI = (capI + 1) % CAPS.length; } },
+        { label: SHAPES[shapeI].name, act() { shapeI = (shapeI + 1) % SHAPES.length; } },
+        { label: PALS[palI].name, act() { palI = (palI + 1) % PALS.length; store.set('lavaPal', palI); } },
+        { label: 'Reset', act() { init(); } },
+        { label: 'Found ' + discovered('lava') + '/9', stat: true }
       ];
     }
   };
