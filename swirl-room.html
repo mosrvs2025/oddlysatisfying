@@ -1001,20 +1001,51 @@ const Sand = (() => {
     { name: 'Dusk', f: h => { const u = wave(h); return hsl(.62 + u * .35, .6, .32 + .38 * wave(h * 2.3)); } },
     { name: 'Mono', f: h => { const u = wave(h * 1.5); return hsl(.6, .06, .2 + u * .7); } }
   ];
-  let g, gw, gh, cell, oc, octx, img, b32, palI = store.get('sandPal', 0) % pals.length, hue = Math.random(), frameN = 0;
-  let tool = 'pour', drain = false, grains = 0;
+  // g: packed colour per cell. M: meta per cell = material (bits 0-1: 1 loose, 2 kinetic, 3 glass) | spout (bits 2-4) | band (bits 5-12)
+  let g, M, gw, gh, cell, oc, octx, img, b32, palI = store.get('sandPal', 0) % pals.length, hue = Math.random(), frameN = 0;
+  let tool = 'pour', drain = false, grains = 0, wind = 0, windT = 0, spouts = 0, layers = false, glass = false;
+  let neckWin = 0, scanN = 0, flipA = 0, hgFlipped = 0, hgStart = 0, neckFlow = 0, neckIdle = 0, drift = 0, carvedAt = -9, t = 0, sliceCheck = null;
+  const TOOLS = ['pour', 'kinetic', 'carve', 'slice'], TNAME = { pour: 'Pour', kinetic: 'Kinetic', carve: 'Carve', slice: 'Slice' };
   const BG = (255 << 24) | (19 << 16) | (14 << 8) | 12; // #0c0e13 packed ABGR
+  const GLASS = (255 << 24) | (40 << 16) | (33 << 8) | 29;
   function pack(c, j) {
     const r = clamp(c[0] * j * 255, 0, 255) | 0, gg = clamp(c[1] * j * 255, 0, 255) | 0, b = clamp(c[2] * j * 255, 0, 255) | 0;
     return (255 << 24) | (b << 16) | (gg << 8) | r;
   }
-  function grain() { hue += 1 / 5200; grains++; return pack(pals[palI].f(hue), rand(.88, 1.1)); }
+  const band = () => (grains / 900 | 0) & 255;
+  function grainCol(off) {
+    hue += 1 / 5200; grains++;
+    // in Layers mode the colour steps in crisp bands instead of drifting
+    const h = layers ? (band() * .137 + (off || 0)) : hue + (off || 0);
+    return pack(pals[palI].f(h), layers ? rand(.93, 1.05) : rand(.88, 1.1));
+  }
+  function put(i, mat, sp, off) { g[i] = grainCol(off); M[i] = mat | (sp << 2) | (band() << 5); }
+  function hgHalf(y) { // hourglass inner half-width at row y (symmetric under a 180 degree turn)
+    const mid = (gh - 1) / 2, u = Math.abs(y - mid) / mid, neck = 2.2;
+    return neck + (gw * .36 - neck) * Math.pow(Math.min(1, u * 1.3), 1.5);
+  }
+  function buildGlass() {
+    const cx = (gw - 1) / 2;
+    for (let y = 0; y < gh; y++) {
+      const w = hgHalf(y);
+      for (let x = 0; x < gw; x++) { const i = y * gw + x; if (Math.abs(x - cx) > w || y < 2 || y > gh - 3) { g[i] = GLASS; M[i] = 3; } }
+    }
+  }
+  function fillTop() { // pour strata into the top bulb
+    const mid = gh / 2 | 0;
+    for (let y = mid - 4; y >= gh * .1; y--) {
+      const L = ((mid - y) / (gh * .045)) | 0, col = pals[palI].f(hue + L * .11);
+      for (let x = 0; x < gw; x++) { const i = y * gw + x; if (!g[i]) { g[i] = pack(col, rand(.9, 1.08)); M[i] = 1 | ((L & 255) << 5); } }
+    }
+    hue += .6;
+  }
   function init() {
     const B = bounds();
     cell = W < 700 ? 3 : 4; gw = Math.ceil(W / cell); gh = Math.floor(B.bottom / cell);
-    g = new Uint32Array(gw * gh);
+    g = new Uint32Array(gw * gh); M = new Uint16Array(gw * gh);
     oc = document.createElement('canvas'); oc.width = gw; oc.height = gh; octx = oc.getContext('2d');
     img = octx.createImageData(gw, gh); b32 = new Uint32Array(img.data.buffer);
+    if (glass) { buildGlass(); fillTop(); hgStart = t; return; }
     // start with a few strata already poured, so the jar isn't empty
     const ph = [rand(0, 6), rand(0, 6), rand(0, 6)];
     for (let x = 0; x < gw; x++) {
@@ -1022,76 +1053,191 @@ const Sand = (() => {
       for (let L = 0; L < 5; L++) {
         const th = Math.max(1, Math.round(gh * .028 + Math.sin(x / gw * 6 + ph[L % 3] + L) * gh * .012 + Math.sin(x / gw * 17 + L * 2) * 2));
         const col = pals[palI].f(hue + L * .09);
-        for (let k = 0; k < th && top > 0; k++) { top--; g[top * gw + x] = pack(col, rand(.88, 1.1)); }
+        for (let k = 0; k < th && top > 0; k++) { top--; g[top * gw + x] = pack(col, rand(.88, 1.1)); M[top * gw + x] = 1 | ((200 + L) << 5); }
       }
     }
     hue += 5 * .09;
   }
   function paint(p) {
-    const r = tool === 'pour' ? Math.max(3, Math.round(12 / cell)) : Math.max(5, Math.round(26 / cell));
+    const pouring = tool === 'pour' || tool === 'kinetic';
+    const r = pouring ? Math.max(3, Math.round(12 / cell)) : Math.max(5, Math.round(26 / cell));
     const steps = Math.max(1, Math.ceil(Math.hypot(p.x - p.px, p.y - p.py) / (r * cell)));
     for (let s = 1; s <= steps; s++) {
       const cx = (p.px + (p.x - p.px) * s / steps) / cell | 0, cy = (p.py + (p.y - p.py) * s / steps) / cell | 0;
-      if (tool === 'pour') {
-        for (let k = 0; k < 7; k++) {
+      if (pouring) {
+        const mat = tool === 'pour' ? 1 : 2;
+        for (let k = 0; k < (mat === 2 ? 11 : 7); k++) {
           const a = Math.random() * 6.283, d = Math.sqrt(Math.random()) * r, x = cx + Math.cos(a) * d | 0, y = cy + Math.sin(a) * d | 0;
-          if (x >= 0 && x < gw && y >= 0 && y < gh && !g[y * gw + x]) g[y * gw + x] = grain();
+          if (x >= 0 && x < gw && y >= 0 && y < gh && !g[y * gw + x]) put(y * gw + x, mat, 0, 0);
         }
-      } else {
+      } else if (tool === 'carve') {
         for (let y = cy - r; y <= cy + r; y++) for (let x = cx - r; x <= cx + r; x++) {
           if (x < 0 || x >= gw || y < 0 || y >= gh) continue;
-          if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) g[y * gw + x] = 0;
+          const i = y * gw + x;
+          if ((M[i] & 3) !== 3 && (x - cx) ** 2 + (y - cy) ** 2 <= r * r) { g[i] = 0; M[i] = 0; }
         }
-      }
+        carvedAt = t;
+      } else slice(cx);
     }
   }
+  // a clean vertical cut from the surface to the floor: loose sand slumps back in, kinetic sand keeps a wall that shows its layers
+  function slice(cx) {
+    const seen = new Set();
+    for (let x = cx - 1; x <= cx + 1; x++) {
+      if (x < 0 || x >= gw) continue;
+      for (let y = 0; y < gh; y++) { const i = y * gw + x; if (g[i] && (M[i] & 3) !== 3) { seen.add(M[i] >> 5); g[i] = 0; M[i] = 0; } }
+    }
+    if (!sliceCheck || seen.size >= sliceCheck.bands) sliceCheck = { x: cx, t, bands: seen.size };
+  }
+  function mv(i, j) { g[j] = g[i]; M[j] = M[i]; g[i] = 0; M[i] = 0; }
   function update() {
-    let moved = 0; frameN++;
-    const h0 = gw * .44 | 0, h1 = gw * .56 | 0;
+    let moved = 0, held = 0, blown = 0; frameN++;
+    const h0 = gw * .44 | 0, h1 = gw * .56 | 0, wa = Math.abs(wind), wd = wind > 0 ? 1 : -1;
+    const neckY = (gh / 2) | 0;
     for (let y = gh - 1; y >= 0; y--) {
-      const row = y * gw, ltr = (frameN + y) & 1;
+      // sideways moves only when scanning against the wind, so a grain can't be carried twice in one pass
+      const row = y * gw, ltr = (frameN + y) & 1, sideOK = wa > 0 && (ltr ? wd < 0 : wd > 0);
       for (let xi = 0; xi < gw; xi++) {
         const x = ltr ? xi : gw - 1 - xi, i = row + x, c = g[i];
         if (!c) continue;
-        if (y === gh - 1) { if (drain && x >= h0 && x < h1) { g[i] = 0; moved++; } continue; }
+        const mat = M[i] & 3; if (mat === 3) continue;
+        if (y === gh - 1) { if (drain && !glass && x >= h0 && x < h1) { g[i] = 0; M[i] = 0; moved++; } continue; }
         const b = i + gw;
-        if (!g[b]) { g[b] = c; g[i] = 0; moved++; continue; }
-        const dl = x > 0 && !g[b - 1], dr = x < gw - 1 && !g[b + 1];
-        if (dl && dr) { if (Math.random() < .5) g[b - 1] = c; else g[b + 1] = c; g[i] = 0; moved++; }
-        else if (dl) { g[b - 1] = c; g[i] = 0; moved++; }
-        else if (dr) { g[b + 1] = c; g[i] = 0; moved++; }
+        if (!g[b]) {
+          if (mat === 2) { // kinetic: clings to neighbours on both sides and sags slowly
+            const l = x > 0 && (M[i - 1] & 3) >= 2, r = x < gw - 1 && (M[i + 1] & 3) >= 2; // damp sand clings to glass too
+            if (l && r && Math.random() < .985) { held++; continue; }
+          }
+          if (sideOK && Math.random() < wa * (mat === 2 ? .3 : 1)) { const xs = x + wd; if (xs >= 0 && xs < gw && !g[b + wd]) { mv(i, b + wd); moved++; continue; } }
+          mv(i, b); moved++; if (y === neckY) neckFlow++; continue;
+        }
+        let dl = x > 0 && !g[b - 1], dr = x < gw - 1 && !g[b + 1];
+        if (mat === 2) { // kinetic holds steep faces: it only slides off a drop at least two cells deep, and reluctantly
+          if (dl && (y + 2 >= gh || g[b + gw - 1])) dl = false;
+          if (dr && (y + 2 >= gh || g[b + gw + 1])) dr = false;
+          // cohesion: grains bound to kinetic neighbours behind them crumble away only rarely, so cut faces stand
+          if (dl && Math.random() < (x < gw - 1 && (M[i + 1] & 3) === 2 ? .985 : .7)) dl = false;
+          if (dr && Math.random() < (x > 0 && (M[i - 1] & 3) === 2 ? .985 : .7)) dr = false;
+        }
+        if (dl && dr) { if (Math.random() < .5) mv(i, b - 1); else mv(i, b + 1); moved++; }
+        else if (dl) { mv(i, b - 1); moved++; }
+        else if (dr) { mv(i, b + 1); moved++; }
+        else if (mat === 1 && sideOK && y > 0 && !g[i - gw] && Math.random() < wa * .05) {
+          // exposed surface grains get lifted and hop downwind: dunes creep
+          const xs = x + wd, s = i + wd;
+          if (xs >= 0 && xs < gw && !g[s - gw]) { mv(i, s - gw); blown++; }
+        }
       }
     }
-    return moved;
+    drift += blown;
+    return { moved, held };
+  }
+  const spoutX = k => Math.round(gw * (k + 1) / (spouts + 1) + Math.sin(t * .3 + k * 2) * gw * .04);
+  function spoutPour() {
+    if (!spouts || glass) return;
+    for (let k = 0; k < spouts; k++) {
+      const sx = spoutX(k);
+      for (let n = 0; n < 3; n++) { const x = sx + (Math.random() * 3 | 0) - 1, i = 3 * gw + x; if (x >= 0 && x < gw && !g[i]) put(i, 1, k + 1, k * .31); }
+    }
+  }
+  function scanDisc(held) {
+    if (held > 60) discover('sand', 'overhang', 'Overhang', 'Kinetic sand clings to itself: a ledge hangs over thin air, sagging grain by grain.');
+    const tops = new Int32Array(gw).fill(gh);
+    for (let x = 0; x < gw; x++) for (let y = 0; y < gh; y++) { const i = y * gw + x; if (g[i] && (M[i] & 3) !== 3) { tops[x] = y; break; } }
+    // sheer cliff: a kinetic column whose neighbour drops away by 25+ cells
+    for (let x = 1; x < gw; x++) {
+      const d = tops[x] - tops[x - 1];
+      if (Math.abs(d) >= 25) {
+        const hx = d > 0 ? x - 1 : x, ty = tops[hx];
+        if (ty + 12 < gh && (M[ty * gw + hx] & 3) === 2 && (M[(ty + 12) * gw + hx] & 3) === 2) { discover('sand', 'cliff', 'Sheer cliff', 'Kinetic sand stands in a wall no loose pile could hold.'); break; }
+      }
+    }
+    // braided streams: sand from two different spouts lying side by side
+    if (spouts > 1) {
+      let meet = 0;
+      for (let k = 0; k < 400; k++) { const i = (Math.random() * (g.length - 1)) | 0, a = (M[i] >> 2) & 7, b = (M[i + 1] >> 2) & 7; if ((M[i] & 3) === 1 && a && b && a !== b) meet++; }
+      if (meet) discover('sand', 'braid', 'Braided streams', 'Two spouts’ piles met, and their colours interleave along the seam.');
+    }
+    if (sliceCheck && t - sliceCheck.t > 1.5) {
+      // did the cut stay open? count empty cells in the slice column below the neighbours' surface
+      const x = sliceCheck.x; let open = 0;
+      if (x > 2 && x < gw - 3) for (let y = Math.max(tops[x - 3], tops[x + 3]); y < gh; y++) if (!g[y * gw + x]) open++;
+      if (open > 20 && sliceCheck.bands >= 3) discover('sand', 'slice', 'Core sample', 'The cut held open and showed ' + sliceCheck.bands + ' layers, stacked in the order they were poured.');
+      sliceCheck = null;
+    }
+    if (drift > 400) discover('sand', 'dune', 'Dune creep', 'Wind skims grains off the windward slope and drops them in the lee: the whole pile walks.');
   }
   return {
-    name: 'Sand', canvas: '2d', hint: 'Hold to pour. Or tap Terrarium for a whole living world of fire, water, plants and lightning.',
+    name: 'Sand', canvas: '2d', hint: 'Hold to pour. Try wind, kinetic sand, spouts or the hourglass. Or tap Terrarium for a whole living world.',
     enter() { if (!g) init(); },
     resize() { init(); },
+    down(p) { if (g && tool === 'slice') slice(p.x / cell | 0); },
     frame(dt) {
       if (!g) init();
+      t += dt;
       for (const p of P.values()) paint(p);
-      const m = update() + update() + update();
-      Snd.hiss(Math.min(m / 5000, .22), 2600);
+      spoutPour();
+      windT = wind ? windT + dt : 0;
+      let m = 0, held = 0;
+      for (let s = 0; s < 3; s++) { const r = update(); m += r.moved; held = r.held; }
+      if (m > 6000 && t - carvedAt < 1.5 && !P.size) discover('sand', 'slide', 'Landslide', 'Undercut the slope and the whole face let go at once.');
+      if (glass) {
+        // hourglass bookkeeping: grains through the neck, jams, an emptied top bulb
+        const mid = gh / 2 | 0; let top = 0;
+        for (let i = 0; i < mid * gw; i++) if (g[i] && (M[i] & 3) !== 3) top++;
+        neckIdle += dt; neckWin += neckFlow;
+        if (neckIdle > 3) {
+          const slow = neckWin < 20 && top > 30 && t - hgStart > 2; neckIdle = 0; neckWin = 0;
+          if (slow) {
+          let kin = 0; for (let y = mid - 4; y <= mid; y++) for (let x = 0; x < gw; x++) if ((M[y * gw + x] & 3) === 2) kin++;
+          if (kin) discover('sand', 'jam', 'Arched neck', 'Kinetic grains bridged the neck and the hourglass all but stopped keeping time.');
+          }
+        }
+        if (top === 0 && hgFlipped && t - hgStart > 3) { discover('sand', 'hourglass', 'Timekeeper', 'Every grain found its way through the neck: ' + (t - hgStart).toFixed(1) + ' seconds for one flip.'); hgStart = 1e9; }
+        neckFlow = 0;
+      }
+      if ((++scanN & 31) === 0) scanDisc(held);
+      Snd.hiss(Math.min(m / 5000, .22) + Math.abs(wind) * .06, wind ? 1400 : 2600);
       b32.fill(BG);
       for (let i = 0, n = g.length; i < n; i++) if (g[i]) b32[i] = g[i];
       octx.putImageData(img, 0, 0);
       ctx.fillStyle = '#0c0e13'; ctx.fillRect(0, 0, W, H);
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(oc, 0, 0, gw * cell, gh * cell);
+      if (flipA > 0) { // the flip: the grid already turned over, the picture catches up
+        flipA = Math.max(0, flipA - dt * 3.2);
+        const e = flipA * flipA * (3 - 2 * flipA), cx = gw * cell / 2, cy = gh * cell / 2;
+        ctx.save(); ctx.translate(cx, cy); ctx.rotate(e * Math.PI); ctx.translate(-cx, -cy);
+        ctx.drawImage(oc, 0, 0, gw * cell, gh * cell); ctx.restore();
+      } else ctx.drawImage(oc, 0, 0, gw * cell, gh * cell);
       const fy = gh * cell;
       ctx.fillStyle = 'rgba(255,255,255,.14)'; ctx.fillRect(0, fy, W, 2);
-      if (drain) { const x0 = (gw * .44 | 0) * cell, x1 = (gw * .56 | 0) * cell; ctx.fillStyle = '#0b0d13'; ctx.fillRect(x0, fy - 1, x1 - x0, 4); }
+      if (drain && !glass) { const x0 = (gw * .44 | 0) * cell, x1 = (gw * .56 | 0) * cell; ctx.fillStyle = '#0b0d13'; ctx.fillRect(x0, fy - 1, x1 - x0, 4); }
+      if (spouts && !glass) { ctx.fillStyle = 'rgba(255,255,255,.35)'; for (let k = 0; k < spouts; k++) ctx.fillRect(spoutX(k) * cell - 5, 0, 10, 12); }
+      if (wind) { // faint streaks show the wind
+        ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 1; ctx.beginPath();
+        for (let k = 0; k < 14; k++) {
+          const y = 90 + ((k * 97) % Math.max(1, fy - 110)), span = W + 80, x = (((k * 173 + windT * 700 * wind) % span) + span) % span - 40;
+          ctx.moveTo(x, y); ctx.lineTo(x - wind * 60, y);
+        }
+        ctx.stroke();
+      }
     },
     chips() {
-      return [
+      const n = discovered('sand');
+      const list = [
         { label: 'Terrarium ✦', act() { openWorld(); } },
-        { label: 'Pour', on: tool === 'pour', act() { tool = 'pour'; } },
-        { label: 'Carve', on: tool === 'carve', act() { tool = 'carve'; } },
-        { label: 'Drain', on: drain, act() { drain = !drain; } },
-        { label: pals[palI].name, act() { palI = (palI + 1) % pals.length; store.set('sandPal', palI); } },
-        { label: 'Empty', act() { g.fill(0); } }
+        { label: TNAME[tool], on: true, act() { tool = TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]; } },
+        { label: wind ? (wind > 0 ? 'Wind →' : 'Wind ←') : 'Wind', on: !!wind, act() { wind = wind === 0 ? .35 : wind > 0 ? -.35 : 0; } }
       ];
+      if (glass) list.push({ label: 'Flip ⟲', act() { g.reverse(); M.reverse(); flipA = 1; hgFlipped++; hgStart = t; neckIdle = 0; Snd.blorp(.5, .6); } });
+      else list.push({ label: spouts ? `Spouts ${spouts}` : 'Spouts', on: !!spouts, act() { spouts = spouts === 0 ? 1 : spouts === 1 ? 3 : 0; } });
+      list.push({ label: 'Hourglass', on: glass, act() { glass = !glass; hgFlipped = 0; init(); } });
+      list.push({ label: 'Layers', on: layers, act() { layers = !layers; } });
+      if (!glass) list.push({ label: 'Drain', on: drain, act() { drain = !drain; } });
+      list.push({ label: pals[palI].name, act() { palI = (palI + 1) % pals.length; store.set('sandPal', palI); } });
+      list.push({ label: glass ? 'Refill' : 'Empty', act() { if (glass) init(); else { g.fill(0); M.fill(0); } } });
+      if (n) list.push({ label: `✦ ${n}/8`, stat: true });
+      return list;
     }
   };
 })();
@@ -2237,124 +2383,343 @@ const Cym = (() => {
 
 /* ================= DOMINO: draw a line, push the first one ================= */
 const Dom = (() => {
-  const LEN = 30, WID = 17, TH = 5, GAP = 15, CELL = 48;
-  let ds = [], grid = new Map(), draw = null, fallen = 0, clickAt = 0, hueRun = Math.random();
-  const key = (x, y) => ((x / CELL) | 0) + ',' + ((y / CELL) | 0);
+  // piece kinds: n domino, s small, b big, bell (chime domino), split (splitter), gate (latch), sw (switch). Balls live apart.
+  const K = {
+    n: { L: 30, W: 17, T: 5, gap: 15, m: 1, name: 'Domino' },
+    s: { L: 20, W: 11, T: 4, gap: 10, m: .38, name: 'Small' },
+    b: { L: 46, W: 27, T: 8, gap: 23, m: 2.6, name: 'Big' },
+    bell: { L: 30, W: 17, T: 5, gap: 16, m: 1, name: 'Chime' },
+    split: { L: 30, W: 24, T: 6, gap: 17, m: 1, name: 'Splitter' },
+    gate: { L: 30, W: 19, T: 6, gap: 16, m: 1, name: 'Gate' },
+    sw: { L: 30, W: 17, T: 5, gap: 15, m: 1, name: 'Switch' }
+  };
+  const PLACE = ['n', 's', 'b', 'bell', 'split', 'ball', 'gate', 'sw'];
+  const LAYOUTS = ['Spiral', 'Stairs', 'Tree', 'Scale', 'Relay'];
+  const SCALE = [0, 2, 4, 7, 9];
+  const CELL = 56, BR = 8;
+  let ds = [], balls = [], grid = new Map(), draw = null, clickAt = 0, hueRun = Math.random(), bellN = 0;
+  let place = 'n', layoutI = 0, chainN = 0, branchN = 0, best = store.get('domBest', 0), curChain = 0;
+  const chains = new Map(), branches = new Map();
+  let fallOrder = [], rew = null, follow = false, lastHit = null, lastPushT = -9, t = 0, bellTimes = [];
+  const cam = { x: 0, y: 0, z: 1 };
+  const key = (x, y) => Math.floor(x / CELL) + ',' + Math.floor(y / CELL);
   function reindex() { grid = new Map(); ds.forEach((d, i) => { const k = key(d.x, d.y); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(i); }); }
   function near(x, y, r) {
     const out = [];
-    for (let gx = ((x - r) / CELL) | 0; gx <= ((x + r) / CELL | 0); gx++) for (let gy = ((y - r) / CELL) | 0; gy <= ((y + r) / CELL | 0); gy++) { const c = grid.get(gx + ',' + gy); if (c) out.push(...c); }
+    for (let gx = Math.floor((x - r) / CELL); gx <= Math.floor((x + r) / CELL); gx++) for (let gy = Math.floor((y - r) / CELL); gy <= Math.floor((y + r) / CELL); gy++) { const c = grid.get(gx + ',' + gy); if (c) out.push(...c); }
     return out;
   }
-  function add(x, y, dx, dy) {
-    for (const j of near(x, y, GAP)) { const o = ds[j]; if ((o.x - x) ** 2 + (o.y - y) ** 2 < (GAP * .7) ** 2) return false; }
-    const d = { x, y, dx, dy, a: 0, w: 0, st: 0, h: hueRun, lean: null };
+  function add(x, y, dx, dy, k) {
+    k = k || 'n'; const s = K[k];
+    for (const j of near(x, y, 30)) { const o = ds[j]; if ((o.x - x) ** 2 + (o.y - y) ** 2 < (Math.min(s.gap, o.gap) * .7) ** 2) return false; }
+    const d = { x, y, dx, dy, a: 0, w: 0, st: 0, h: hueRun, lean: null, k, L: s.L, Wd: s.W, T: s.T, gap: s.gap, m: s.m, wob: 0, chain: 0, run: 0, origin: k, branch: 0, open: false, open0: false, bySwitch: false, rays: 0 };
+    if (k === 'bell') { d.pitch = bellN++; }
     hueRun += .006; ds.push(d);
-    const k = key(x, y); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(ds.length - 1);
+    const kk = key(x, y); if (!grid.has(kk)) grid.set(kk, []); grid.get(kk).push(ds.length - 1);
     return true;
   }
+  function addBall(x, y) { balls.push({ x, y, hx: x, hy: y, vx: 0, vy: 0, fromDom: false, dist: 0 }); }
+  function reset() { ds = []; balls = []; grid = new Map(); fallOrder = []; rew = null; bellN = 0; lastHit = null; chains.clear(); branches.clear(); }
+  // lay pieces along a polyline, spaced by each piece's own gap, facing along the path
+  function along(pts, kindAt) {
+    let acc = 0, need = 0, idx = 0, prevGap = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const [x0, y0] = pts[i - 1], [x1, y1] = pts[i], sl = Math.hypot(x1 - x0, y1 - y0); if (!sl) continue;
+      for (let u = 0; u < sl; u += 1) {
+        acc += 1;
+        const k = kindAt(idx, acc);
+        const gap = k === 'ball' ? 22 : Math.max(K[k].gap, prevGap);
+        if (idx === 0 || acc - need >= gap) {
+          const x = x0 + (x1 - x0) * u / sl, y = y0 + (y1 - y0) * u / sl;
+          if (k === 'ball') addBall(x, y); else add(x, y, (x1 - x0) / sl, (y1 - y0) / sl, k);
+          need = acc; idx++; prevGap = k === 'ball' ? 22 : K[k].gap;
+        }
+      }
+    }
+  }
+  function box() { const B = bounds(); return { x0: 24, x1: W - 24, y0: B.top + 70, y1: B.bottom - 20 }; }
+  function snake(rows, rowGap) { // boustrophedon path with round ends
+    const b = box(), pts = [], r = rowGap / 2;
+    for (let row = 0; row < rows; row++) {
+      const y = b.y0 + row * rowGap, ltr = row % 2 === 0, xa = ltr ? b.x0 + r : b.x1 - r, xb = ltr ? b.x1 - r : b.x0 + r;
+      pts.push([xa, y], [xb, y]);
+      if (row < rows - 1) for (let a = 1; a < 12; a++) { const th = -Math.PI / 2 + a / 12 * Math.PI; pts.push([xb + (ltr ? 1 : -1) * Math.cos(th) * r, y + r + Math.sin(th) * r]); }
+    }
+    return pts;
+  }
   function spiral() {
-    ds = []; grid = new Map();
     const B = bounds(), cx = W / 2, cy = (B.top + B.bottom) / 2, maxR = Math.min(W / 2, (B.bottom - B.top) / 2) - 26;
     let th = 1.2, prev = null;
     for (let i = 0; i < 2000; i++) {
       const r = 26 + th * 5.2; if (r > maxR) break;
       const x = cx + Math.cos(th) * r, y = cy + Math.sin(th) * r;
-      if (!prev || Math.hypot(x - prev[0], y - prev[1]) >= GAP) {
+      if (!prev || Math.hypot(x - prev[0], y - prev[1]) >= 15) {
         const tx = -Math.sin(th) * r + Math.cos(th) * 5.2, ty = Math.cos(th) * r + Math.sin(th) * 5.2, tl = Math.hypot(tx, ty);
-        add(x, y, tx / tl, ty / tl); prev = [x, y];
+        add(x, y, tx / tl, ty / tl, 'n'); prev = [x, y];
       }
       th += .02;
     }
   }
-  function push(d, sx, sy, w) { if (d.st) return; d.st = 1; d.w = w; if (sx * d.dx + sy * d.dy < 0) { d.dx = -d.dx; d.dy = -d.dy; } }
-  function click(i) {
-    const now = performance.now(); if (now - clickAt < 18) return; clickAt = now;
-    Snd.tick(1400 + (i % 24) * 40);
+  function layout(name) {
+    reset();
+    const b = box(), h = b.y1 - b.y0;
+    if (name === 'Spiral') spiral();
+    else if (name === 'Stairs') { // small ones build speed, then step up through normal to big
+      const rows = Math.max(3, Math.min(7, h / 64 | 0)), pts = snake(rows, h / rows), total = rows * (b.x1 - b.x0) * 1.1;
+      along(pts, (i, s) => { const u = (s / total * 3) % 1; return u < .45 ? 's' : u < .75 ? 'n' : 'b'; });
+    } else if (name === 'Tree') { // a trunk that forks at every splitter
+      const grow = (x, y, ang, len, depth) => {
+        const x1 = x + Math.cos(ang) * len, y1 = y + Math.sin(ang) * len;
+        along([[x, y], [x1, y1]], () => 'n');
+        const ex = x1 + Math.cos(ang) * 16, ey = y1 + Math.sin(ang) * 16;
+        if (depth <= 0) { add(ex, ey, Math.cos(ang), Math.sin(ang), 'bell'); return; }
+        add(ex, ey, Math.cos(ang), Math.sin(ang), 'split');
+        for (const sgn of [-1, 1]) { const a2 = ang + sgn * .6; grow(ex + Math.cos(a2) * 17, ey + Math.sin(a2) * 17, a2, len * .72, depth - 1); }
+      };
+      grow(W / 2, b.y1 - 10, -Math.PI / 2, Math.min(h * .3, W * .3, 150), W < 500 ? 3 : 4);
+    } else if (name === 'Scale') { // a wandering line of chimes
+      const rows = Math.max(2, Math.min(5, h / 90 | 0)), pts = snake(rows, h / rows).map(([x, y], i) => [x, y + Math.sin(x / 38) * 12]);
+      along(pts, () => 'bell');
+    } else { // Relay: chain -> switch opens a gate further on -> ball -> another chain
+      const y1 = b.y0 + h * .15, y2 = b.y0 + h * .5, y3 = b.y0 + h * .85, r = (y2 - y1) / 2;
+      const p1 = [[b.x0, y1], [b.x1 - r, y1]];
+      for (let a = 1; a < 12; a++) { const th = -Math.PI / 2 + a / 12 * Math.PI; p1.push([b.x1 - r + Math.cos(th) * r, y1 + r + Math.sin(th) * r]); }
+      const ex = b.x0 + 40;
+      p1.push([ex, y2]);
+      for (let a = 1; a <= 8; a++) { const th = -Math.PI / 2 - a / 8 * Math.PI / 2; p1.push([ex + Math.cos(th) * 20, y2 + 20 + Math.sin(th) * 20]); }
+      const seg1 = b.x1 - r - b.x0, S = seg1 * .4, G = seg1 + Math.PI * r + (b.x1 - r - ex) * .35;
+      along(p1, (i, s) => s >= S && s < S + 15 ? 'sw' : s >= G && s < G + 16 ? 'gate' : 'n');
+      for (const d of ds) if (d.k === 'gate') { d.open = d.open0 = false; }
+      addBall(ex - 20, y2 + 46);
+      const p3 = [[ex - 20, y2 + 130], [ex - 20, y3 - 30]];
+      for (let a = 1; a <= 8; a++) { const th = Math.PI - a / 8 * Math.PI / 2; p3.push([ex + 10 + Math.cos(th) * 30, y3 - 30 + Math.sin(th) * 30]); }
+      p3.push([b.x1, y3]);
+      along(p3, i => i % 6 === 5 ? 'bell' : 'n');
+    }
   }
+  function bellFreq(p) { const o = Math.floor(p / 5) % 3; return 392 * Math.pow(2, (SCALE[p % 5] + o * 12) / 12); }
+  function click(d) {
+    if (d.k === 'bell') {
+      Snd.note(bellFreq(d.pitch), .13, 1.3);
+      bellTimes.push(t); while (bellTimes.length && t - bellTimes[0] > 4) bellTimes.shift();
+      if (bellTimes.length >= 8) discover('dom', 'melody', 'Falling melody', 'Eight chimes rang in one run: the chain played the tune its layout spelled out.');
+      return;
+    }
+    const now = performance.now(); if (now - clickAt < 18) return; clickAt = now;
+    Snd.tick(d.k === 'b' ? 520 : d.k === 's' ? 2600 : 1400 + (ds.indexOf(d) % 24) * 40);
+  }
+  // topple o. from = the piece (or null for a finger/ball) that did it
+  function push(o, sx, sy, w, from) {
+    if (o.st) return; o.st = 1; o.w = clamp(w, 4.5, 16); o.rays = 0;
+    if (sx * o.dx + sy * o.dy < 0) { o.dx = -o.dx; o.dy = -o.dy; }
+    if (from) { o.chain = from.chain; o.origin = from.origin; o.run = from.k === o.k ? from.run + 1 : 0; o.branch = from.branch; o.mid = from.mid || from.k === 'n'; }
+    else { o.chain = ++chainN; o.origin = o.k; o.run = 0; o.branch = 0; o.mid = false; }
+    const c = (chains.get(o.chain) || 0) + 1; chains.set(o.chain, c); curChain = c;
+    if (c > best) { best = c; store.set('domBest', best); }
+    if (c >= 100) discover('dom', 'century', 'Century', 'One push, a hundred dominoes: a single chain ran unbroken.');
+    if (o.branch) { const br = branches.get(o.branch); if (br) { br.n++; const sib = branches.get(br.sib); if (br.n >= 8 && sib && sib.n >= 8) discover('dom', 'fork', 'Fork', 'A splitter sent one wave down two paths, and both kept going.'); } }
+    if (o.k === 'b' && from && from.k === 's') discover('dom', 'giant', 'Giant slayer', 'A run of small dominoes built enough speed to fell a big one.');
+    else if (o.k === 'b' && from && o.origin === 's' && o.mid) discover('dom', 'amp', 'Amplifier', 'Small tipped medium tipped big: each step can topple one larger than itself.');
+    if (o.k === 'gate' && o.bySwitch) discover('dom', 'logic', 'Interlock', 'One chain opened the gate, and the wave passed through it: dominoes doing logic.');
+    if (o.k === 'sw') for (const gt of ds) if (gt.k === 'gate' && !gt.st) { gt.open = !gt.open; gt.bySwitch = gt.open; gt.wob = 1; }
+    fallOrder.push(o); lastHit = o; lastPushT = t; click(o);
+  }
+  function rot(x, y, a) { const c = Math.cos(a), s = Math.sin(a); return [x * c - y * s, x * s + y * c]; }
   function update(dt) {
     for (let i = 0; i < ds.length; i++) {
       const d = ds[i];
+      if (d.wob > 0) d.wob = Math.max(0, d.wob - dt * 2.5);
       if (d.st === 1) {
-        d.w += (34 * Math.sin(d.a) + 3) * dt; d.a += d.w * dt;
-        const reach = LEN * Math.sin(Math.min(d.a, Math.PI / 2));
-        for (const j of near(d.x, d.y, LEN + 6)) {
-          if (j === i) continue; const o = ds[j]; if (o.st) continue;
-          const rx = o.x - d.x, ry = o.y - d.y, along = rx * d.dx + ry * d.dy, lat = Math.abs(rx * d.dy - ry * d.dx);
-          if (along > 0 && along <= reach + TH && lat < WID * .75) {
-            push(o, d.dx, d.dy, Math.max(d.w * .8, 4.5)); click(j); fallen++;
-            d.st = 2; d.lean = { o, along }; d.w = 0; break;
+        // taller pieces fall slower; the swing speed carried in from the last hit adds up along a chain
+        d.w += (34 * Math.sin(d.a) + 3) * (30 / d.L) * dt; d.a += d.w * dt;
+        const reach = d.L * Math.sin(Math.min(d.a, Math.PI / 2));
+        const rays = d.k === 'split' ? [rot(d.dx, d.dy, .6), rot(d.dx, d.dy, -.6)] : [[d.dx, d.dy]];
+        for (let r = 0; r < rays.length && d.st === 1; r++) {
+          if (d.rays & (1 << r)) continue;
+          const [ux, uy] = rays[r];
+          for (const j of near(d.x, d.y, d.L + 30)) {
+            if (j === i) continue; const o = ds[j];
+            const rx = o.x - d.x, ry = o.y - d.y, al = rx * ux + ry * uy, lat = Math.abs(rx * uy - ry * ux);
+            if (al <= 0 || al > reach + (d.T + o.T) / 2 || lat > d.Wd * .5 + o.Wd * .28) continue;
+            if (o.st === 1 && o.chain !== d.chain && o.dx * ux + o.dy * uy < -.5) { discover('dom', 'headon', 'Head-on', 'Two waves met from opposite sides and fell into each other.'); continue; }
+            if (o.st) continue;
+            const impulse = d.m * d.w * (1 + .3 * Math.min(d.run, 10)), need = o.m * 2.4;
+            const blocked = (o.k === 'gate' && !o.open) || impulse < need;
+            if (blocked) {
+              o.wob = 1; click(o);
+              if (o.k === 'b' && (chains.get(d.chain) || 0) >= 10) discover('dom', 'stall', 'Immovable', 'The wave hit something heavier than it could move, and died against it.');
+              if (d.k === 'split') { d.rays |= 1 << r; break; }
+              d.st = 2; d.lean = { o, along: al }; d.w = 0; break;
+            }
+            let from = d;
+            if (d.k === 'split') { // each ray starts its own branch
+              const b1 = ++branchN; branches.set(b1, { n: 0, sib: r === 0 ? b1 + 1 : b1 - 1 });
+              from = Object.assign({}, d, { branch: b1 });
+              d.rays |= 1 << r;
+              push(o, ux, uy, Math.max(d.w * .85, 4.5), from);
+            } else {
+              push(o, ux, uy, Math.max(d.w * .85, 4.5), from);
+              d.st = 2; d.lean = { o, along: al }; d.w = 0;
+            }
+            break;
+          }
+          if (d.st !== 1) break;
+          // the falling tip can hit a ball, which rolls away
+          for (const bl of balls) {
+            const rx = bl.x - d.x, ry = bl.y - d.y, al = rx * ux + ry * uy, lat = Math.abs(rx * uy - ry * ux);
+            if (al > 0 && al < reach + BR && lat < d.Wd * .5 + BR && bl.vx * ux + bl.vy * uy < 40) { bl.vx = ux * (60 + d.w * 22 * d.m); bl.vy = uy * (60 + d.w * 22 * d.m); bl.fromDom = true; bl.dist = 0; Snd.blorp(.35, 1.6); }
           }
         }
-        if (d.st === 1 && d.a >= Math.PI / 2) { d.a = Math.PI / 2; d.st = 3; click(i); }
+        if (d.st === 1 && d.a >= Math.PI / 2) { d.a = Math.PI / 2; d.st = 3; click(d); }
       } else if (d.st === 2) {
         // resting on the one it hit: it settles lower as that one falls
-        const o = d.lean.o, base = Math.asin(clamp((d.lean.along - TH) / LEN, 0, 1));
+        const o = d.lean.o, base = Math.asin(clamp((d.lean.along - o.T / 2 - d.T / 2) / d.L, 0, 1));
         d.a = Math.min(Math.PI / 2 - .12, base + (o.a / (Math.PI / 2)) * (Math.PI / 2 - .12 - base));
       }
     }
+    const B = bounds();
+    for (const bl of balls) {
+      const sp = Math.hypot(bl.vx, bl.vy); if (sp < 1) { bl.vx = bl.vy = 0; continue; }
+      bl.x += bl.vx * dt; bl.y += bl.vy * dt; bl.dist += sp * dt;
+      const f = Math.exp(-.45 * dt); bl.vx *= f; bl.vy *= f;
+      if (bl.x < BR) { bl.x = BR; bl.vx = Math.abs(bl.vx) * .8; } if (bl.x > W - BR) { bl.x = W - BR; bl.vx = -Math.abs(bl.vx) * .8; }
+      if (bl.y < B.top + BR) { bl.y = B.top + BR; bl.vy = Math.abs(bl.vy) * .8; } if (bl.y > B.bottom - BR) { bl.y = B.bottom - BR; bl.vy = -Math.abs(bl.vy) * .8; }
+      for (const j of near(bl.x, bl.y, 30)) {
+        const o = ds[j]; if (o.st) continue;
+        const rx = bl.x - o.x, ry = bl.y - o.y, e = Math.hypot(rx, ry); if (e > BR + o.Wd * .45 || !e) continue;
+        if ((o.k === 'gate' && !o.open) || sp < 30) { // bounce off
+          const nx = rx / e, ny = ry / e, vn = bl.vx * nx + bl.vy * ny;
+          if (vn < 0) { bl.vx -= 1.8 * vn * nx; bl.vy -= 1.8 * vn * ny; o.wob = 1; }
+          continue;
+        }
+        push(o, bl.vx / sp, bl.vy / sp, 4.5 + sp / 60, null);
+        if (bl.fromDom && bl.dist > 60) discover('dom', 'relay', 'Relay', 'A domino set the ball rolling, and the ball started a new chain somewhere else.');
+        bl.vx *= .6; bl.vy *= .6;
+      }
+      for (const c of balls) { // ball-on-ball, equal masses
+        if (c === bl) continue; const rx = c.x - bl.x, ry = c.y - bl.y, e = Math.hypot(rx, ry);
+        if (e > 0 && e < BR * 2) { const nx = rx / e, ny = ry / e, rel = (bl.vx - c.vx) * nx + (bl.vy - c.vy) * ny; if (rel > 0) { bl.vx -= rel * nx; bl.vy -= rel * ny; c.vx += rel * nx; c.vy += rel * ny; c.fromDom = bl.fromDom; c.dist = 0; Snd.tick(900); } c.x += nx * (BR * 2 - e) / 2; c.y += ny * (BR * 2 - e) / 2; }
+      }
+    }
   }
+  function rewind(dt) { // re-raise in reverse order, gathering speed
+    rew.t += dt;
+    const target = Math.min(rew.list.length, Math.floor(rew.t * (30 + rew.t * 40)));
+    while (rew.i < target) { const d = rew.list[rew.i++]; d.st = 4; d.lean = null; d.w = 0; }
+    let busy = rew.i < rew.list.length;
+    for (const d of ds) if (d.st === 4) {
+      d.a = Math.max(0, d.a - (d.a * 9 + 2) * dt); busy = true;
+      if (d.a === 0) { d.st = 0; d.run = 0; d.rays = 0; const now = performance.now(); if (now - clickAt > 25) { clickAt = now; Snd.tick(900 + 1400 * (1 - rew.i / rew.list.length)); } }
+    }
+    for (const bl of balls) { bl.vx = bl.vy = 0; bl.x += (bl.hx - bl.x) * Math.min(1, dt * 6); bl.y += (bl.hy - bl.y) * Math.min(1, dt * 6); bl.fromDom = false; }
+    if (!busy) {
+      if (rew.list.length >= 60) discover('dom', 'rewind', 'Rewind', rew.list.length + ' dominoes stood back up, last fallen first.');
+      for (const d of ds) if (d.k === 'gate') { d.open = d.open0; d.bySwitch = false; }
+      fallOrder = []; chains.clear(); rew = null;
+    }
+  }
+  function col(h, s, l) { const c = hsl(h, s, l); return `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`; }
   function drawOne(d) {
-    const c = Math.cos(d.a), s = Math.sin(d.a), px = -d.dy, py = d.dx;
-    const col = hsl(d.h, .75, .56 + .08 * c), cs = `rgb(${col.map(v => v * 255 | 0).join(',')})`;
-    const bx = d.x - d.dx * TH / 2, by = d.y - d.dy * TH / 2;        // back bottom edge (it pivots on the front edge)
-    const fx = d.x + d.dx * TH / 2, fy = d.y + d.dy * TH / 2;        // front bottom edge
-    const tip = LEN * s;
-    // shadow grows with height
+    const c = Math.cos(d.a), s = Math.sin(d.a), px = -d.dy, py = d.dx, L = d.L, WD = d.Wd, TH = d.T;
+    const wob = d.wob ? Math.sin(d.wob * 30) * d.wob * 2 : 0;
+    const x = d.x + d.dx * wob, y = d.y + d.dy * wob;
+    let face, top;
+    if (d.k === 'bell') { face = col(.12, .8, .5 + .08 * c); top = col(.13, .9, .78); }
+    else if (d.k === 'gate') { face = d.open ? col(.36, .55, .45 + .08 * c) : col(.99, .65, .5 + .08 * c); top = d.open ? col(.36, .6, .75) : col(.99, .7, .75); }
+    else if (d.k === 'sw') { face = col(.6, .1, .8 + .06 * c); top = col(.6, .1, .95); }
+    else if (d.k === 'split') { face = col(d.h + .5, .6, .48 + .08 * c); top = col(d.h + .5, .5, .78); }
+    else { const l = d.k === 's' ? .66 : d.k === 'b' ? .44 : .56; face = col(d.h, .75, l + .08 * c); top = col(d.h, .6, l + .26); }
+    const bx = x - d.dx * TH / 2, by = y - d.dy * TH / 2, fx = x + d.dx * TH / 2, fy = y + d.dy * TH / 2, tip = L * s;
     ctx.fillStyle = 'rgba(0,0,0,.35)';
-    const sh = c * LEN * .35;
+    const sh = c * L * .35;
     ctx.beginPath();
-    ctx.moveTo(bx + px * WID / 2, by + py * WID / 2); ctx.lineTo(bx - px * WID / 2, by - py * WID / 2);
-    ctx.lineTo(fx - px * WID / 2 + tip * d.dx + sh, fy - py * WID / 2 + tip * d.dy + sh * 1.4); ctx.lineTo(fx + px * WID / 2 + tip * d.dx + sh, fy + py * WID / 2 + tip * d.dy + sh * 1.4);
+    ctx.moveTo(bx + px * WD / 2, by + py * WD / 2); ctx.lineTo(bx - px * WD / 2, by - py * WD / 2);
+    ctx.lineTo(fx - px * WD / 2 + tip * d.dx + sh, fy - py * WD / 2 + tip * d.dy + sh * 1.4); ctx.lineTo(fx + px * WD / 2 + tip * d.dx + sh, fy + py * WD / 2 + tip * d.dy + sh * 1.4);
     ctx.closePath(); ctx.fill();
-    // big face (visible once it leans), then the top edge
     const t0x = bx + d.dx * tip, t0y = by + d.dy * tip, t1x = t0x + d.dx * TH * c, t1y = t0y + d.dy * TH * c;
-    ctx.fillStyle = cs;
+    ctx.fillStyle = face;
     ctx.beginPath();
-    ctx.moveTo(bx + px * WID / 2, by + py * WID / 2); ctx.lineTo(bx - px * WID / 2, by - py * WID / 2);
-    ctx.lineTo(t0x - px * WID / 2, t0y - py * WID / 2); ctx.lineTo(t0x + px * WID / 2, t0y + py * WID / 2); ctx.closePath(); ctx.fill();
-    const top = hsl(d.h, .6, .82);
-    ctx.fillStyle = `rgb(${top.map(v => v * 255 | 0).join(',')})`;
+    ctx.moveTo(bx + px * WD / 2, by + py * WD / 2); ctx.lineTo(bx - px * WD / 2, by - py * WD / 2);
+    ctx.lineTo(t0x - px * WD / 2, t0y - py * WD / 2); ctx.lineTo(t0x + px * WD / 2, t0y + py * WD / 2); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = top;
     ctx.beginPath();
-    ctx.moveTo(t0x + px * WID / 2, t0y + py * WID / 2); ctx.lineTo(t0x - px * WID / 2, t0y - py * WID / 2);
-    ctx.lineTo(t1x - px * WID / 2, t1y - py * WID / 2); ctx.lineTo(t1x + px * WID / 2, t1y + py * WID / 2); ctx.closePath(); ctx.fill();
-    if (d.a > .3) { ctx.fillStyle = 'rgba(255,255,255,.55)'; const mx = (bx + t0x) / 2, my = (by + t0y) / 2; ctx.beginPath(); ctx.arc(mx, my, 1.6, 0, Math.PI * 2); ctx.fill(); }
+    ctx.moveTo(t0x + px * WD / 2, t0y + py * WD / 2); ctx.lineTo(t0x - px * WD / 2, t0y - py * WD / 2);
+    ctx.lineTo(t1x - px * WD / 2, t1y - py * WD / 2); ctx.lineTo(t1x + px * WD / 2, t1y + py * WD / 2); ctx.closePath(); ctx.fill();
+    const mx = (bx + t0x + d.dx * TH * c) / 2, my = (by + t0y + d.dy * TH * c) / 2;
+    if (d.k === 'split' && d.a < .4) { // the two directions it will send the wave
+      ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 1.5; ctx.beginPath();
+      for (const sg of [-1, 1]) { const [ux, uy] = rot(d.dx, d.dy, sg * .6); ctx.moveTo(x, y); ctx.lineTo(x + ux * 9, y + uy * 9); } ctx.stroke();
+    } else if (d.k === 'sw' && d.a < .4) { ctx.strokeStyle = 'rgba(40,40,60,.8)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 6.283); ctx.stroke(); }
+    else if (d.k === 'bell' && d.a < .4) { ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.beginPath(); ctx.arc(x, y, 2.2, 0, 6.283); ctx.fill(); }
+    else if (d.a > .3) { ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.beginPath(); ctx.arc(mx, my, d.k === 'b' ? 2.4 : 1.6, 0, Math.PI * 2); ctx.fill(); }
   }
+  function drawBall(bl) {
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.arc(bl.x + 3, bl.y + 4, BR, 0, 6.283); ctx.fill();
+    const gr = ctx.createRadialGradient(bl.x - 3, bl.y - 3, 1, bl.x, bl.y, BR);
+    gr.addColorStop(0, '#fff'); gr.addColorStop(.35, '#c9d3e6'); gr.addColorStop(1, '#5a6478');
+    ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(bl.x, bl.y, BR, 0, 6.283); ctx.fill();
+  }
+  const toWorld = p => ({ x: (p.x - W / 2) / cam.z + cam.x, y: (p.y - H / 2) / cam.z + cam.y });
   return {
-    name: 'Dominoes', canvas: '2d', hint: 'Tap a domino to knock it over. Drag on empty floor to lay a new line.',
-    enter() { if (!ds.length) spiral(); },
-    resize() { spiral(); },
+    name: 'Dominoes', canvas: '2d', hint: 'Tap a domino to knock it over. Drag to lay a line of the chosen piece. Try the layouts.',
+    enter() { if (!ds.length && !balls.length) spiral(); if (!cam.x) { cam.x = W / 2; cam.y = H / 2; } },
+    resize() { layout(LAYOUTS[layoutI]); cam.x = W / 2; cam.y = H / 2; cam.z = 1; },
     down(p) {
-      let best = -1, bd = 22 * 22;
-      for (const j of near(p.x, p.y, 24)) { const d = ds[j]; if (d.st) continue; const e = (d.x - p.x) ** 2 + (d.y - p.y) ** 2; if (e < bd) { bd = e; best = j; } }
-      if (best >= 0) { const d = ds[best]; push(d, d.x - p.x || d.dx, d.y - p.y || d.dy, 4.5); click(best); draw = null; return; }
-      draw = { p, lx: p.x, ly: p.y, first: true };
+      const q = toWorld(p);
+      for (const bl of balls) { const e = Math.hypot(bl.x - q.x, bl.y - q.y); if (e < 20) { const s = 280 / (e || 1); bl.vx = (bl.x - q.x || 1) * s; bl.vy = (bl.y - q.y) * s; bl.fromDom = false; draw = null; return; } }
+      let bestJ = -1, bd = 22 * 22;
+      for (const j of near(q.x, q.y, 30)) { const d = ds[j]; if (d.st) continue; const e = (d.x - q.x) ** 2 + (d.y - q.y) ** 2; if (e < bd) { bd = e; bestJ = j; } }
+      if (bestJ >= 0) {
+        const d = ds[bestJ];
+        if (d.k === 'gate') { d.open = !d.open; d.open0 = d.open; d.bySwitch = false; d.wob = 1; Snd.tick(d.open ? 1800 : 700); }
+        else push(d, d.x - q.x || d.dx, d.y - q.y || d.dy, 4.5, null);
+        draw = null; return;
+      }
+      if (place === 'ball') { addBall(q.x, q.y); draw = null; return; }
+      draw = { p, lx: q.x, ly: q.y };
     },
     up(p) { if (draw && draw.p === p) draw = null; },
     frame(dt) {
+      t += dt;
       if (draw) {
-        const p = draw.p, ddx = p.x - draw.lx, ddy = p.y - draw.ly, dl = Math.hypot(ddx, ddy);
-        if (dl >= GAP) {
-          const n = Math.floor(dl / GAP);
-          for (let k = 1; k <= n; k++) { const x = draw.lx + ddx / dl * GAP, y = draw.ly + ddy / dl * GAP; add(x, y, ddx / dl, ddy / dl); draw.lx = x; draw.ly = y; }
+        const q = toWorld(draw.p), gap = K[place].gap, ddx = q.x - draw.lx, ddy = q.y - draw.ly, dl = Math.hypot(ddx, ddy);
+        if (dl >= gap) {
+          const n = Math.floor(dl / gap);
+          for (let k = 1; k <= n; k++) { const x = draw.lx + ddx / dl * gap, y = draw.ly + ddy / dl * gap; add(x, y, ddx / dl, ddy / dl, place); draw.lx = x; draw.ly = y; }
           if (ds.length > 1600) { ds.splice(0, ds.length - 1600); reindex(); }
         }
       }
-      const sub = 3; for (let s = 0; s < sub; s++) update(Math.min(dt, 1 / 30) / sub);
+      // slow-mo follow cam: zoom in on the wavefront while a chain is running
+      const active = t - lastPushT < .5 && lastHit && !rew;
+      const tz = follow && active ? 2 : 1, tx = follow && active ? lastHit.x : W / 2, ty = follow && active ? lastHit.y : H / 2;
+      const k = Math.min(1, dt * (follow && active ? 3 : 2));
+      cam.z += (tz - cam.z) * k; cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k;
+      const ts = follow && active ? .3 : 1;
+      if (rew) rewind(dt);
+      else { const sub = 3; for (let s = 0; s < sub; s++) update(Math.min(dt, 1 / 30) * ts / sub); }
       ctx.fillStyle = '#12100f'; ctx.fillRect(0, 0, W, H);
       const fl = ctx.createRadialGradient(W / 2, H * .45, 20, W / 2, H * .45, Math.max(W, H) * .75);
       fl.addColorStop(0, '#2a2420'); fl.addColorStop(1, '#100e0d'); ctx.fillStyle = fl; ctx.fillRect(0, 0, W, H);
+      ctx.setTransform(DPR * cam.z, 0, 0, DPR * cam.z, DPR * (W / 2 - cam.x * cam.z), DPR * (H / 2 - cam.y * cam.z));
       const order = ds.slice().sort((a, b) => b.a - a.a);
       for (const d of order) drawOne(d);
+      for (const bl of balls) drawBall(bl);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      if (follow && cam.z > 1.05) { ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.font = '600 11px system-ui,sans-serif'; ctx.fillText('SLOW-MO  ·  ' + curChain, 16, bounds().bottom - 12); }
     },
     chips() {
       let standing = 0; for (const d of ds) if (!d.st) standing++;
-      return [
-        { label: `${standing} standing`, stat: true },
-        { label: 'Stand up', act() { for (const d of ds) { d.a = 0; d.w = 0; d.st = 0; d.lean = null; } } },
-        { label: 'Spiral', act() { spiral(); } },
-        { label: 'Clear', act() { ds = []; grid = new Map(); } }
+      const n = discovered('dom');
+      const list = [
+        { label: `${standing} up · best ${best}`, stat: true },
+        { label: '+ ' + (place === 'ball' ? 'Ball' : K[place].name), on: true, act() { place = PLACE[(PLACE.indexOf(place) + 1) % PLACE.length]; } },
+        { label: LAYOUTS[layoutI] + ' ▸', act() { layoutI = (layoutI + 1) % LAYOUTS.length; layout(LAYOUTS[layoutI]); } },
+        { label: 'Slow-mo', on: follow, act() { follow = !follow; } },
+        { label: 'Rewind', act() { if (fallOrder.length && !rew) rew = { list: fallOrder.slice().reverse(), i: 0, t: 0 }; } },
+        { label: 'Clear', act() { reset(); } }
       ];
+      if (n) list.push({ label: `✦ ${n}/10`, stat: true });
+      return list;
     }
   };
 })();
