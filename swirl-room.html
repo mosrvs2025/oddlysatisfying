@@ -1036,66 +1036,289 @@ const Slime = (() => {
 
 /* ================= SWING: a pendulum wave ================= */
 const Pend = (() => {
-  // 15 pendulums; pendulum i completes 51+i swings in 60 s. Lengths follow from T = 2π√(L/g).
-  const N = 15, TC = 60, K = 51, g = 9.81;
-  const T = [], Lm = [];
-  for (let i = 0; i < N; i++) { T.push(TC / (K + i)); Lm.push(g * (T[i] / (2 * Math.PI)) ** 2); }
+  // Four pendulum systems sharing one physics core (θ'' = −g/L·sin θ − c·θ' + couplings), integrated at a fixed step.
+  //  Wave: pendulum i makes K+i swings per minute on Earth; nothing is scripted, the pattern falls out of the lengths.
+  //  Pair: two equal pendulums joined by a spring trade their energy back and forth.
+  //  Metronomes: self-driven pendulums on one free-sliding beam; the beam's wobble slowly pulls them into step.
+  //  Chaos: double pendulums; a twin started a hair apart shows how fast tiny differences grow.
+  const TC = 60, K = 51, HS = 1 / 600;
+  const GRAV = [{ l: 'Earth', g: 9.81 }, { l: 'Moon', g: 1.62 }, { l: 'Jupiter', g: 24.8 }];
+  const DAMP = [{ l: 'No drag', c: 0 }, { l: 'Air', c: .06 }, { l: 'Syrup', c: 1.4 }];
+  const COUNTS = [9, 15, 24];
+  const SYS = ['Wave', 'Pair', 'Metronomes', 'Chaos'];
   const PENT = [0, 3, 5, 7, 10];
-  const freq = i => 196 * 2 ** ((PENT[(N - 1 - i) % 5] + 12 * Math.floor((N - 1 - i) / 5)) / 12);
-  let t = 0, amp = .42, hold = null, view = store.get('pendView', 'top'), speed = 1, prev = new Float32Array(N), fresh = true;
-  const theta = i => hold ? amp : amp * Math.cos(2 * Math.PI * t / T[i]);
-  function geom() {
-    const B = bounds();
-    if (view === 'side') {
-      const py = B.top + 18, Lpx = (B.bottom - py - 64) / Lm[0];
-      return i => { const th = theta(i), L = Lm[i] * Lpx; return { x: W / 2 + Math.sin(th) * L, y: py + Math.cos(th) * L, px: W / 2, py }; };
+  let sys = store.get('pendSys', 'Wave'); if (!SYS.includes(sys)) sys = 'Wave';
+  let view = store.get('pendView', 'top'), speed = 1, gi = 0, di = 0, ci = 1, spring = false, stiff = false, beamFree = true, twin = true;
+  let N = 0, Lm, th, om, prev, acc = 0, fresh = true, simT = 0, tRel = 0, amp = .42;
+  let hold = null, bobs = [], singleStart = -1, pairLead = -1, syncT = 0, syncArmed = false, twinT = -1, bx = 0, bv = 0;
+  let aBuf = null, dp = null, trail = [[], []];
+  const g = () => GRAV[gi].g, damp = () => DAMP[di].c;
+  const freq = i => { const k = N - 1 - i; return 196 * 2 ** ((PENT[k % 5] + 12 * Math.floor(k / 5)) / 12); };
+  const wrap = a => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
+  function setup() {
+    fresh = true; hold = null; acc = 0; simT = 0; tRel = 0; singleStart = -1; pairLead = -1; syncT = 0; bx = bv = 0;
+    if (sys === 'Wave') {
+      N = COUNTS[ci]; Lm = []; for (let i = 0; i < N; i++) Lm.push(9.81 * (TC / (K + i) / (2 * Math.PI)) ** 2);
+      th = new Float64Array(N).fill(spring ? 0 : amp); om = new Float64Array(N);
+    } else if (sys === 'Pair') {
+      N = 2; Lm = [.6, .6]; th = Float64Array.from([.5, 0]); om = new Float64Array(2);
+    } else if (sys === 'Metronomes') {
+      N = 5; Lm = []; for (let i = 0; i < N; i++) Lm.push(.25 * (1 + (i - 2) * .003));
+      th = new Float64Array(N); om = new Float64Array(N); scramble();
+    } else {
+      N = 0; dp = [{ a1: 2.2, a2: 2.6, w1: 0, w2: 0 }, { a1: 2.2, a2: 2.601, w1: 0, w2: 0 }]; twinT = 0; trail = [[], []];
     }
-    const span = B.bottom - B.top - 90, s = W * .42 / (Lm[0] * Math.sin(.75));
-    return i => { const y = B.top + 30 + (i + .5) * span / N, th = theta(i); return { x: W / 2 + Math.sin(th) * Lm[i] * s, y, px: W / 2, py: y }; };
+    prev = new Float64Array(Math.max(N, 1));
+  }
+  function scramble() { for (let i = 0; i < N; i++) { const ph = Math.random() * Math.PI * 2; th[i] = .5 * Math.cos(ph); om[i] = -.5 * Math.sin(ph) * Math.sqrt(g() / Lm[i]); } syncArmed = true; syncT = 0; }
+  // one fixed step of the simple-pendulum systems
+  function step(h) {
+    const G = g(), c = damp(), hi = hold && hold.kind === 'bob' ? hold.i : -1;
+    if (!aBuf || aBuf.length !== N) aBuf = new Float64Array(N);
+    const a = aBuf;
+    for (let i = 0; i < N; i++) {
+      let ai = -G / Lm[i] * Math.sin(th[i]) - c * om[i];
+      if (sys === 'Wave' && spring) { const k = 6; if (i > 0) ai += k * (th[i - 1] - th[i]); if (i < N - 1) ai += k * (th[i + 1] - th[i]); }
+      if (sys === 'Pair') { const k = stiff ? 5 : 1.2; ai += k * (th[1 - i] - th[i]); }
+      if (sys === 'Metronomes') { const q = th[i] / .35; ai -= .2 * (q * q - 1) * om[i]; } // escapement: kicks small swings, brakes big ones
+      a[i] = ai;
+    }
+    if (sys === 'Metronomes') {
+      // the beam: momentum of beam + bobs is only changed by its soft centring spring, so x'' = (F − mLΣa)/M
+      let xa = 0;
+      if (beamFree) { let s = 0; for (let i = 0; i < N; i++) s += a[i] * Math.cos(th[i]); xa = -.02 * s * Lm[0] - .3 * bx - .05 * bv; }
+      else { bx = 0; bv = 0; }
+      for (let i = 0; i < N; i++) a[i] -= xa * Math.cos(th[i]) / Lm[i];
+      bv += xa * h; bx += bv * h;
+    }
+    for (let i = 0; i < N; i++) {
+      if (i === hi) continue;
+      om[i] += a[i] * h; th[i] += om[i] * h;
+      if (Math.abs(th[i]) > Math.PI) { th[i] = wrap(th[i]); if (sys !== 'Metronomes') discover('pend', 'loop', 'Loop the loop', 'Flung hard enough, a pendulum goes right over the top instead of swinging back.'); }
+    }
+    if (hold && hold.kind === 'all') for (let i = 0; i < N; i++) { th[i] = amp; om[i] = 0; }
+  }
+  // double pendulum (equal unit masses and lengths) with RK4
+  function dpAcc(s, G, c) {
+    const d = s.a1 - s.a2, den = 3 - Math.cos(2 * d);
+    return [
+      (-3 * G * Math.sin(s.a1) - G * Math.sin(s.a1 - 2 * s.a2) - 2 * Math.sin(d) * (s.w2 * s.w2 + s.w1 * s.w1 * Math.cos(d))) / den - c * s.w1,
+      (2 * Math.sin(d) * (2 * s.w1 * s.w1 + 2 * G * Math.cos(s.a1) + s.w2 * s.w2 * Math.cos(d))) / den - c * s.w2
+    ];
+  }
+  function dpStep(s, h) {
+    const G = g() / 1, c = damp();
+    const f = st => { const [x, y] = dpAcc(st, G, c); return [st.w1, st.w2, x, y]; };
+    const add = (st, k, m) => ({ a1: st.a1 + k[0] * m, a2: st.a2 + k[1] * m, w1: st.w1 + k[2] * m, w2: st.w2 + k[3] * m });
+    const k1 = f(s), k2 = f(add(s, k1, h / 2)), k3 = f(add(s, k2, h / 2)), k4 = f(add(s, k3, h));
+    s.a1 += h / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]); s.a2 += h / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+    s.w1 += h / 6 * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2]); s.w2 += h / 6 * (k1[3] + 2 * k2[3] + 2 * k3[3] + k4[3]);
+  }
+  function area() {
+    const B = bounds(), cb = chipsEl.getBoundingClientRect().bottom;
+    return { top: Math.max(B.top, cb + 6), bottom: B.bottom - 30 };
+  }
+  // where things are on screen, plus the inverse (screen point → angle) for grabbing
+  function geom() {
+    const A = area(), h = A.bottom - A.top;
+    if (sys === 'Wave' && view === 'top') {
+      const span = h - 50, s = W * .42 / (Lm[0] * Math.sin(.75));
+      return {
+        bob: i => { const y = A.top + 20 + (i + .5) * span / N; return { x: W / 2 + Math.sin(th[i]) * Lm[i] * s, y, px: W / 2, py: y }; },
+        angle: (i, p) => Math.asin(clamp((p.x - W / 2) / (Lm[i] * s), -1, 1)), r: clamp(span / N * .3, 5, 13), A
+      };
+    }
+    if (sys === 'Chaos') {
+      const sc = Math.min(W * .22, h * .23), cx = W / 2, cy = A.top + h * .47;
+      return { sc, cx, cy, A };
+    }
+    const py = A.top + 26, Lmax = Math.max(...Lm);
+    const Lpx = Math.min((h - 60) / Lmax, sys === 'Pair' ? W * .7 / Lmax : sys === 'Metronomes' ? Math.min(300, W * .7) / Lmax : 1e9);
+    const piv = i => sys === 'Wave' ? W / 2 : sys === 'Pair' ? W / 2 + (i - .5) * Math.min(W * .42, 260) : W / 2 + (i - (N - 1) / 2) * Math.min(W / (N + .5), 150) + clamp(bx * Lpx * 2, -W * .1, W * .1);
+    return {
+      bob: i => { const L = Lm[i] * Lpx, x0 = piv(i); return { x: x0 + Math.sin(th[i]) * L, y: py + Math.cos(th[i]) * L, px: x0, py }; },
+      angle: (i, p) => Math.atan2(p.x - piv(i), p.y - py), r: sys === 'Wave' ? 9 : 14, py, Lpx, A
+    };
+  }
+  function energyOf(i) { return .5 * Lm[i] * Lm[i] * om[i] * om[i] + g() * Lm[i] * (1 - Math.cos(th[i])); }
+  function discoveries(dt) {
+    if (sys === 'Wave' && !spring && !hold) {
+      const TCg = TC * Math.sqrt(9.81 / g()) * (1 + amp * amp / 16);
+      let mn = 1e9, mx = -1e9; for (let i = 0; i < N; i++) { mn = Math.min(mn, th[i]); mx = Math.max(mx, th[i]); }
+      if (tRel > .8 * TCg && mx - mn < .07 && Math.abs(mx) > .15) {
+        discover('pend', 'realign', 'Back in line', `After ${Math.round(tRel)} s every pendulum has made a whole number of swings, so the line re-forms.`);
+        if (gi !== 0) discover('pend', 'tide', 'Slow tide', `On ${GRAV[gi].l} gravity the same lengths take ${Math.round(tRel)} s to line up again: period grows as 1/√g.`);
+      }
+      let ok = tRel > .3 * TCg && N > 4, sg = 0;
+      for (let i = 0; i < N && ok; i++) { const v = th[i] * (i % 2 ? -1 : 1); if (Math.abs(v) < .1) ok = false; else if (!sg) sg = Math.sign(v); else if (Math.sign(v) !== sg) ok = false; }
+      if (ok) discover('pend', 'halves', 'Two lines', 'Halfway through the cycle, odd and even pendulums are exactly half a swing apart.');
+    }
+    if (sys === 'Wave' && spring && singleStart >= 0) {
+      for (let i = 0; i < N; i++) if (Math.abs(i - singleStart) >= N / 2 && Math.abs(th[i]) > .04) { discover('pend', 'ripple', 'Travelling wave', 'The springs pass one push down the whole row, bob to bob.'); singleStart = -1; break; }
+    }
+    if (sys === 'Pair' && !hold) {
+      const e0 = energyOf(0), e1 = energyOf(1), tot = e0 + e1;
+      if (tot > .02) {
+        const s0 = e0 / tot;
+        if (s0 > .95) { if (pairLead === 1) discover('pend', 'transfer', 'Sympathy', 'All the swing drained into the still pendulum through the spring, and it will drain back.'); pairLead = 0; }
+        if (s0 < .05) { if (pairLead === 0) discover('pend', 'transfer', 'Sympathy', 'All the swing drained into the still pendulum through the spring, and it will drain back.'); pairLead = 1; }
+      }
+    }
+    if (sys === 'Metronomes') {
+      let re = 0, im = 0, live = 0;
+      for (let i = 0; i < N; i++) { const w = Math.sqrt(g() / Lm[i]), ph = Math.atan2(-om[i] / w, th[i]); if (Math.hypot(th[i], om[i] / w) > .15) live++; re += Math.cos(ph); im += Math.sin(ph); }
+      const R = Math.hypot(re, im) / N;
+      syncT = R > .97 && live === N ? syncT + dt : 0;
+      if (syncArmed && beamFree && syncT > 2) { discover('pend', 'sync', 'In step', 'Nobody set them going together: each tick shoves the beam a little, and the beam nudges every metronome into one rhythm.'); syncArmed = false; }
+      return R;
+    }
+    if (sys === 'Chaos' && dp) {
+      const s = dp[0];
+      if (Math.cos(s.a2) < -.97 && Math.abs(s.w2) > 1) discover('pend', 'flip', 'Over the top', 'The outer arm whipped right over the pivot.');
+      if (twin && twinT >= 0 && Math.abs(wrap(dp[0].a2 - dp[1].a2)) > 1.5) {
+        discover('pend', 'butterfly', 'Butterfly effect', `Two pendulums started a thousandth of a radian apart; after ${twinT.toFixed(1)} s they have nothing in common.`);
+        twinT = -1;
+      }
+    }
+    return 0;
+  }
+  function drawBob(x, y, r, col) {
+    ctx.shadowColor = col; ctx.shadowBlur = 18; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.beginPath(); ctx.arc(x - r * .3, y - r * .3, r * .35, 0, Math.PI * 2); ctx.fill();
+  }
+  const colOf = (i, n) => { const c = hsl(.52 + i / Math.max(1, n) * .42, .85, .62); return `rgb(${c.map(v => v * 255 | 0).join(',')})`; };
+  function nearest(p) {
+    let best = null, bd = (sys === 'Wave' ? 24 : 40) ** 2;
+    for (const b of bobs) { const d = (b.x - p.x) ** 2 + (b.y - p.y) ** 2; if (d < bd) { bd = d; best = b; } }
+    return best;
   }
   return {
-    name: 'Swing', canvas: '2d', hint: 'Pull the pendulums to one side and let go.',
-    enter() { fresh = true; },
+    name: 'Swing', canvas: '2d', hint: 'Grab a bob and fling it, or pull the whole row aside and let go. Try the other systems.',
+    enter() { if (!th && !dp) setup(); fresh = true; },
     resize() { fresh = true; },
-    down(p) { hold = p; },
-    move(p) { if (hold === p) amp = clamp((p.x - W / 2) / (W * .42), -1, 1) * .75; },
-    up(p) { if (hold === p) { hold = null; if (Math.abs(amp) < .06) amp = .42; t = 0; } },
-    frame(dt) {
-      if (!hold) t += dt * speed;
-      const at = geom();
-      ctx.fillStyle = fresh || view === 'side' ? '#0a0b12' : 'rgba(10,11,18,.3)'; fresh = false;
-      ctx.fillRect(0, 0, W, H);
-      const B = bounds();
-      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2;
-      ctx.beginPath();
-      if (view === 'side') { ctx.moveTo(W / 2 - 60, B.top + 18); ctx.lineTo(W / 2 + 60, B.top + 18); }
-      else { ctx.moveTo(W / 2, B.top + 20); ctx.lineTo(W / 2, B.bottom - 20); }
-      ctx.stroke();
-      for (let i = 0; i < N; i++) {
-        const q = at(i), th = theta(i), c = hsl(.52 + i / N * .42, .85, .62);
-        const col = `rgb(${c.map(v => v * 255 | 0).join(',')})`;
-        if (view === 'side') { ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(q.px, q.py); ctx.lineTo(q.x, q.y); ctx.stroke(); }
-        else { ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(q.px - W * .42, q.y); ctx.lineTo(q.px + W * .42, q.y); ctx.stroke(); }
-        const r = view === 'side' ? 9 : clamp((B.bottom - B.top) / N * .3, 6, 13);
-        ctx.shadowColor = col; ctx.shadowBlur = 18; ctx.fillStyle = col;
-        ctx.beginPath(); ctx.arc(q.x, q.y, r, 0, Math.PI * 2); ctx.fill();
-        ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,.55)';
-        ctx.beginPath(); ctx.arc(q.x - r * .3, q.y - r * .3, r * .35, 0, Math.PI * 2); ctx.fill();
-        // a note sounds whenever a ball swings through the middle, left to right
-        if (!hold && prev[i] < 0 && th >= 0) Snd.note(freq(i), .05 + .1 * Math.min(1, Math.abs(amp) / .5), .9);
-        prev[i] = th;
-      }
-      const cyc = (t % TC);
-      subEl.textContent = hold ? 'Let go to release' : `${cyc.toFixed(1)} s of ${TC} s · the longest swings ${K} times a minute, the shortest ${K + N - 1}`;
+    down(p) {
+      if (hold) return;
+      const b = nearest(p);
+      if (b) { hold = { p, kind: b.kind, i: b.i, quiet: true }; if (b.kind === 'bob') for (let i = 0; i < N; i++) if (i !== b.i && (Math.abs(th[i]) > .03 || Math.abs(om[i]) > .1)) hold.quiet = false; }
+      else if (sys === 'Wave') hold = { p, kind: 'all' };
     },
-    leave() { subEl.textContent = ''; },
+    move(p) {
+      if (!hold || hold.p !== p) return;
+      if (hold.kind === 'all') amp = clamp((p.x - W / 2) / (W * .42), -1, 1) * .75;
+    },
+    up(p) {
+      if (!hold || hold.p !== p) return;
+      const h = hold; hold = null;
+      if (h.kind === 'all') { if (Math.abs(amp) < .06) amp = .42; for (let i = 0; i < N; i++) { th[i] = amp; om[i] = 0; } tRel = 0; singleStart = -1; }
+      else if (h.kind === 'bob') { singleStart = h.quiet ? h.i : -1; tRel = 1e-9; pairLead = -1; if (sys === 'Metronomes') { syncArmed = true; } }
+      else if (sys === 'Chaos') { const a = dp[0]; dp[1] = { a1: a.a1, a2: a.a2 + .001, w1: a.w1, w2: a.w2 }; twinT = 0; trail = [[], []]; }
+    },
+    frame(dt) {
+      if (!th && !dp) setup();
+      let gm = geom();
+      // held bob follows the finger; its angular velocity is measured so a release flings it
+      if (hold && hold.kind === 'bob') {
+        const na = gm.angle(hold.i, hold.p), prevA = th[hold.i];
+        om[hold.i] = dt > 0 ? .5 * om[hold.i] + .5 * wrap(na - prevA) / dt : 0; th[hold.i] = na;
+      }
+      if (hold && (hold.kind === 'in' || hold.kind === 'out')) {
+        const s = dp[0], pt = hold.p, ang = (x, y) => Math.atan2(x, y);
+        const x1 = gm.cx + Math.sin(s.a1) * gm.sc, y1 = gm.cy + Math.cos(s.a1) * gm.sc;
+        const n = hold.kind === 'in' ? ang(pt.x - gm.cx, pt.y - gm.cy) : ang(pt.x - x1, pt.y - y1);
+        if (hold.kind === 'in') { s.w1 = .5 * s.w1 + .5 * wrap(n - s.a1) / Math.max(dt, 1e-3); s.a1 = n; s.w2 *= .9; }
+        else { s.w2 = .5 * s.w2 + .5 * wrap(n - s.a2) / Math.max(dt, 1e-3); s.a2 = n; s.w1 *= .9; }
+        dp[1] = { a1: s.a1, a2: s.a2, w1: s.w1, w2: s.w2 };
+      }
+      acc = Math.min(acc + dt * speed, .1);
+      while (acc >= HS) {
+        acc -= HS;
+        if (sys === 'Chaos') { if (!hold) { dpStep(dp[0], HS); if (twin) dpStep(dp[1], HS); } }
+        else step(HS);
+        if (!hold) { tRel += HS; if (twinT >= 0) twinT += HS; }
+      }
+      const R = discoveries(dt);
+      gm = geom();
+      const A = gm.A;
+      const fade = sys === 'Wave' && view === 'top' && !fresh;
+      ctx.fillStyle = fade ? 'rgba(10,11,18,.3)' : '#0a0b12'; fresh = false;
+      ctx.fillRect(0, 0, W, H);
+      bobs = [];
+      if (sys === 'Chaos') {
+        const { cx, cy, sc } = gm;
+        for (let k = twin ? 1 : 0; k >= 0; k--) {
+          const s = dp[k], x1 = cx + Math.sin(s.a1) * sc, y1 = cy + Math.cos(s.a1) * sc, x2 = x1 + Math.sin(s.a2) * sc, y2 = y1 + Math.cos(s.a2) * sc;
+          const tr = trail[k]; tr.push(x2, y2); if (tr.length > 700) tr.splice(0, 2);
+          const col = k ? '255,120,170' : '110,200,255';
+          ctx.lineWidth = 1.6;
+          for (let j = 2; j < tr.length; j += 2) { ctx.strokeStyle = `rgba(${col},${(j / tr.length * .8).toFixed(3)})`; ctx.beginPath(); ctx.moveTo(tr[j - 2], tr[j - 1]); ctx.lineTo(tr[j], tr[j + 1]); ctx.stroke(); }
+          ctx.strokeStyle = `rgba(${col},.55)`; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+          drawBob(x1, y1, 10, `rgb(${col})`); drawBob(x2, y2, 12, `rgb(${col})`);
+          if (k === 0) { bobs.push({ x: x1, y: y1, kind: 'in', i: 0 }, { x: x2, y: y2, kind: 'out', i: 0 }); }
+        }
+        ctx.fillStyle = '#bbb'; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill();
+        const d = Math.abs(wrap(dp[0].a2 - dp[1].a2));
+        subEl.textContent = hold ? 'Let go to release' : twin ? `Twins started 0.001 rad apart · now ${d.toFixed(3)} rad apart` : 'Double pendulum · drag either bob';
+        return;
+      }
+      if (sys === 'Wave' && view === 'top') {
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(W / 2, A.top + 10); ctx.lineTo(W / 2, A.bottom - 20); ctx.stroke();
+      } else if (sys === 'Metronomes') {
+        const x0 = W / 2 + clamp(bx * gm.Lpx * 2, -W * .1, W * .1), hw = Math.min(W * .46, 400);
+        ctx.fillStyle = beamFree ? '#3a3f52' : '#5a4040'; ctx.fillRect(x0 - hw, gm.py - 7, hw * 2, 8);
+        ctx.fillStyle = '#6b7080'; for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(x0 + s * (hw - 18), gm.py - 13, 6, 0, Math.PI * 2); ctx.fill(); }
+        if (!beamFree) { ctx.fillStyle = '#a55'; ctx.fillRect(W / 2 - hw - 6, gm.py - 20, 6, 22); ctx.fillRect(W / 2 + hw, gm.py - 20, 6, 22); }
+      } else {
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2; ctx.beginPath();
+        const hw = sys === 'Pair' ? Math.min(W * .3, 200) : 60; ctx.moveTo(W / 2 - hw, gm.py); ctx.lineTo(W / 2 + hw, gm.py); ctx.stroke();
+      }
+      if (sys === 'Pair') { // the spring, 55% of the way down
+        const a = gm.bob(0), b = gm.bob(1), f = .55, ax = a.px + (a.x - a.px) * f, ay = a.py + (a.y - a.py) * f, bxx = b.px + (b.x - b.px) * f, byy = b.py + (b.y - b.py) * f;
+        ctx.strokeStyle = stiff ? '#e8c060' : '#b0a070'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(ax, ay);
+        for (let k = 1; k < 16; k++) { const u = k / 16, n = (k % 2 ? 1 : -1) * 7; ctx.lineTo(ax + (bxx - ax) * u, ay + (byy - ay) * u + n); }
+        ctx.lineTo(bxx, byy); ctx.stroke();
+      }
+      for (let i = 0; i < N; i++) {
+        const q = gm.bob(i), col = colOf(i, N - 1);
+        if (sys === 'Wave' && view === 'top') { ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(q.px - W * .42, q.y); ctx.lineTo(q.px + W * .42, q.y); ctx.stroke(); }
+        else { ctx.strokeStyle = sys === 'Wave' ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.35)'; ctx.lineWidth = sys === 'Wave' ? 1 : 2; ctx.beginPath(); ctx.moveTo(q.px, q.py); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+        if (sys === 'Wave' && spring && i > 0) { const o = gm.bob(i - 1); ctx.strokeStyle = 'rgba(232,192,96,.35)'; ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+        const r = gm.r * (hold && hold.i === i && hold.kind === 'bob' ? 1.25 : 1);
+        drawBob(q.x, q.y, r, col);
+        bobs.push({ x: q.x, y: q.y, kind: 'bob', i });
+        const th0 = th[i];
+        if (!hold) {
+          if (sys === 'Metronomes') { if (prev[i] * th0 < 0) Snd.tick(900 + i * 90); }
+          else if (prev[i] < 0 && th0 >= 0) Snd.note(sys === 'Pair' ? (i ? 330 : 262) : freq(i), .03 + .1 * Math.min(1, Math.abs(om[i]) / 4), .9);
+        }
+        prev[i] = th0;
+      }
+      if (hold) subEl.textContent = 'Let go to release';
+      else if (sys === 'Wave') {
+        const TCg = TC * Math.sqrt(9.81 / g());
+        subEl.textContent = spring ? 'Neighbours joined by springs · flick one bob' : `${(tRel % TCg).toFixed(1)} s of ${TCg.toFixed(0)} s · longest swings ${K}×, shortest ${K + N - 1}× per cycle`;
+      } else if (sys === 'Pair') {
+        const e0 = energyOf(0), e1 = energyOf(1), t = e0 + e1 || 1;
+        subEl.textContent = `Energy  ${'▮'.repeat(Math.round(e0 / t * 10)).padEnd(10, '▯')}  ${'▮'.repeat(Math.round(e1 / t * 10)).padEnd(10, '▯')}`;
+      } else subEl.textContent = `In step: ${Math.round(R * 100)}% · beam ${beamFree ? 'free to slide' : 'clamped'}`;
+      const found = discovered('pend'); if (found) subEl.textContent += ` · ${found}/9 found`;
+    },
+    leave() { subEl.textContent = ''; hold = null; },
     chips() {
-      return [
-        { label: 'Side', on: view === 'side', act() { view = 'side'; store.set('pendView', view); fresh = true; } },
-        { label: 'Above', on: view === 'top', act() { view = 'top'; store.set('pendView', view); fresh = true; } },
-        { label: speed + '×', act() { speed = speed === 1 ? 2 : speed === 2 ? 4 : 1; } },
-        { label: 'Restart', act() { t = 0; amp = amp || .42; } }
-      ];
+      const L = [{ label: sys, act() { sys = SYS[(SYS.indexOf(sys) + 1) % SYS.length]; store.set('pendSys', sys); setup(); } }];
+      if (sys === 'Wave') {
+        L.push({ label: N + ' bobs', act() { ci = (ci + 1) % COUNTS.length; setup(); } });
+        L.push({ label: view === 'top' ? 'Above' : 'Side', act() { view = view === 'top' ? 'side' : 'top'; store.set('pendView', view); fresh = true; } });
+        L.push({ label: 'Springs', on: spring, act() { spring = !spring; setup(); } });
+      } else if (sys === 'Pair') L.push({ label: stiff ? 'Stiff spring' : 'Soft spring', act() { stiff = !stiff; } });
+      else if (sys === 'Metronomes') { L.push({ label: beamFree ? 'Beam free' : 'Beam clamped', act() { beamFree = !beamFree; } }); L.push({ label: 'Scramble', act() { scramble(); } }); }
+      else L.push({ label: 'Twin', on: twin, act() { twin = !twin; const a = dp[0]; dp[1] = { a1: a.a1, a2: a.a2 + .001, w1: a.w1, w2: a.w2 }; twinT = twin ? 0 : -1; trail = [[], []]; } });
+      L.push({ label: GRAV[gi].l, act() { gi = (gi + 1) % GRAV.length; tRel = 0; } });
+      L.push({ label: DAMP[di].l, act() { di = (di + 1) % DAMP.length; } });
+      L.push({ label: speed + '×', act() { speed = speed === 1 ? 2 : speed === 2 ? 4 : 1; } });
+      L.push({ label: 'Reset', act() { setup(); } });
+      return L;
     }
   };
 })();
@@ -1326,101 +1549,325 @@ const Lava = (() => {
 
 /* ================= CYMATICS: a vibrating plate sorts sand into the shape of a sound ================= */
 const Cym = (() => {
-  const G = 120, MAXK = 16;
+  // A vibrating plate. Tones (slider, chord, sweep or the microphone) excite the plate's resonant modes; each mode is a
+  // standing-wave shape. Grains feel the local shaking: sand and salt are bounced off the moving parts and settle on the
+  // still (nodal) lines, light powder is carried by air currents up to the most violent spots (antinodes).
+  const G = 120, MAXK = 16, FMIN = 60, FMAX = 2600;
   const COS = []; for (let k = 0; k <= MAXK; k++) { const a = new Float32Array(G); for (let g = 0; g < G; g++) a[g] = Math.cos(k * Math.PI * g / (G - 1)); COS.push(a); }
   // free square plate: mode (n,m) rings near f ∝ n²+m²
-  const MODES = [];
-  for (let n = 0; n <= MAXK; n++) for (let m = n + 1; m <= MAXK; m++) { const f = 13 * (n * n + m * m); if (f >= 60 && f <= 2600) MODES.push({ n, m, f, s: (n + m) % 2 ? 1 : -1 }); }
-  MODES.sort((a, b) => a.f - b.f);
-  const F = new Float32Array(G * G);
-  let gain = 0, freq = store.get('cymF', 520), sweep = false, sweepDir = 1, plate = null, lastF = -1, near = null;
-  let NG = 0, gx, gy, gb, alive, oc, octx, img, b32;
-  function compute() {
-    lastF = freq; F.fill(0); gain = 0; near = null;
-    for (const md of MODES) {
-      const w = 1 / (1 + ((freq - md.f) / (md.f * .016)) ** 2);
-      if (w > gain) { gain = w; near = md; }
-      if (w < .03) continue;
-      const cn = COS[md.n], cm = COS[md.m];
-      for (let y = 0; y < G; y++) { const a = cn[y] * w, b = cm[y] * w * md.s; const row = y * G; for (let x = 0; x < G; x++) F[row + x] += cm[x] * a + cn[x] * b; }
+  const SQ = [];
+  for (let n = 0; n <= MAXK; n++) for (let m = n + 1; m <= MAXK; m++) { const f = 13 * (n * n + m * m); if (f >= FMIN && f <= FMAX) SQ.push({ n, m, f, s: (n + m) % 2 ? 1 : -1, kind: 'sq' }); }
+  SQ.sort((a, b) => a.f - b.f);
+  // circular plate: J_m(x r)·cos(mθ), x a turning point of J_m (free rim), f ∝ x². Bessel from its integral form.
+  const BX = 20, BS = 0.01, BN = BX / BS | 0, BM = 9, JT = [];
+  for (let m = 0; m < BM; m++) {
+    const a = new Float32Array(BN + 2);
+    for (let i = 0; i <= BN + 1; i++) { const x = i * BS; let s = 0; const K = 48; for (let k = 0; k < K; k++) { const tau = (k + .5) * Math.PI / K; s += Math.cos(m * tau - x * Math.sin(tau)); } a[i] = s / K; }
+    JT.push(a);
+  }
+  const J = (m, x) => { const u = x / BS, i = u | 0, f = u - i; const a = JT[m]; return i >= BN ? a[BN] : a[i] * (1 - f) + a[i + 1] * f; };
+  const CI = [];
+  for (let m = 0; m < BM; m++) { const a = JT[m]; let k = 0; for (let i = 2; i < BN; i++) { const d0 = a[i] - a[i - 1], d1 = a[i + 1] - a[i]; if (d0 * d1 < 0 && i * BS > .5) { k++; const x = i * BS, f = 10.5 * x * x; if (f >= FMIN && f <= FMAX) CI.push({ m, k, x, f, kind: 'ci' }); } } }
+  CI.sort((a, b) => a.f - b.f);
+  // plate outlines (unit square coordinates)
+  const violinW = y => {
+    if (y < .03 || y > .97) return 0;
+    let w = 0;
+    if (Math.abs(y - .27) < .25) w = Math.max(w, .30 * Math.sqrt(1 - ((y - .27) / .25) ** 2));
+    if (Math.abs(y - .71) < .27) w = Math.max(w, .37 * Math.sqrt(1 - ((y - .71) / .27) ** 2));
+    if (Math.abs(y - .48) < .1) w = Math.min(w, .19 + 3 * (y - .48) ** 2);
+    return w;
+  };
+  const fhole = (u, v) => { const dx = Math.abs(u - .5) - .13 - .025 * Math.sin((v - .5) * 26), dy = (v - .5) / .08; return dx * dx / (.012 * .012) + dy * dy < 1; };
+  const SHAPES = ['Square', 'Circle', 'Violin'];
+  const inside = {
+    Square: () => true,
+    Circle: (u, v) => (u - .5) ** 2 + (v - .5) ** 2 <= .25,
+    Violin: (u, v) => Math.abs(u - .5) < violinW(v) && !fhole(u, v)
+  };
+  const GRAINS = ['Sand', 'Salt', 'Powder'];
+  const TONES = [{ label: '1 tone', r: [1] }, { label: 'Fifth', r: [1, 1.5] }, { label: 'Major', r: [1, 1.26, 1.5] }, { label: 'Minor', r: [1, 1.19, 1.5] }];
+  const F = new Float32Array(G * G), MASK = new Uint8Array(G * G);
+  let shape = store.get('cymShape', 'Square'); if (!SHAPES.includes(shape)) shape = 'Square';
+  let grain = 0, toneIx = 0, modes = SQ, MW = new Float32Array(SQ.length), dirty = true;
+  let gain = 0, freq = store.get('cymF', 520), sweep = false, sweepDir = 1, plate = null, near = null, nearW = 0;
+  let NG = 0, gx, gy, gt, gb, alive, oc, octx, img, b32, platePath = null, chipsBottom = -1;
+  // microphone
+  let mic = null, micOn = false, micErr = '', micPeaks = [], spec = null, banner = null, bannerT = 0;
+  // discovery bookkeeping
+  let holdT = 0, sweepSeen = new Set(), sweepN = 0, pouredOff = 0;
+  const bank = [];
+  function fieldOf(md) {
+    if (md.fld) return md.fld;
+    const a = new Float32Array(G * G);
+    if (md.kind === 'sq') { const cn = COS[md.n], cm = COS[md.m]; for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) a[y * G + x] = cm[x] * cn[y] + md.s * cn[x] * cm[y]; }
+    else {
+      let mx = 1e-6;
+      for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+        const u = x / (G - 1) * 2 - 1, v = y / (G - 1) * 2 - 1, r = Math.hypot(u, v);
+        const val = r > 1 ? 0 : J(md.m, md.x * r) * Math.cos(md.m * Math.atan2(v, u)); a[y * G + x] = val; mx = Math.max(mx, Math.abs(val));
+      }
+      for (let i = 0; i < a.length; i++) a[i] /= mx;
+    }
+    return md.fld = a;
+  }
+  function setShape(s) {
+    shape = s; store.set('cymShape', s);
+    modes = s === 'Circle' ? CI : SQ; MW = new Float32Array(modes.length); dirty = true;
+    for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) MASK[y * G + x] = inside[s](x / (G - 1), y / (G - 1)) ? 1 : 0;
+    if (plate) { buildPath(); if (gx) for (let i = 0; i < NG; i++) if (alive[i] && !MASK[cell(gx[i], gy[i])]) respawn(i, gt[i]); }
+  }
+  const cell = (x, y) => ((y * (G - 1) + .5) | 0) * G + ((x * (G - 1) + .5) | 0);
+  function respawn(i, type) {
+    for (let k = 0; k < 40; k++) { const x = Math.random(), y = Math.random(); if (MASK[cell(x, y)]) { gx[i] = x; gy[i] = y; gt[i] = type; alive[i] = 1; return; } }
+    alive[i] = 0;
+  }
+  function buildPath() {
+    const { x, y, S } = plate, p = new Path2D();
+    if (shape === 'Square') p.rect(x, y, S, S);
+    else if (shape === 'Circle') p.arc(x + S / 2, y + S / 2, S / 2, 0, Math.PI * 2);
+    else {
+      const pts = []; for (let k = 0; k <= 80; k++) { const v = .03 + .94 * k / 80; pts.push([v, violinW(v)]); }
+      p.moveTo(x + S * .5, y + S * .03);
+      for (const [v, w] of pts) p.lineTo(x + S * (.5 + w), y + S * v);
+      for (let k = pts.length - 1; k >= 0; k--) p.lineTo(x + S * (.5 - pts[k][1]), y + S * pts[k][0]);
+      p.closePath();
+    }
+    platePath = p;
+  }
+  function layout() {
+    const B = bounds(), cb = chipsEl.getBoundingClientRect().bottom;
+    chipsBottom = cb;
+    const top = Math.max(B.top + 8, cb + 8), avail = B.bottom - top - 110;
+    const S = Math.max(120, Math.floor(Math.min(W - 32, avail)));
+    plate = { x: Math.round((W - S) / 2), y: Math.round(top + Math.max(0, (avail - S) / 2)), S };
+    const px = Math.ceil(S * Math.min(DPR, 1.5));
+    if (!oc || oc.width !== px) { oc = document.createElement('canvas'); oc.width = px; oc.height = px; octx = oc.getContext('2d'); img = octx.createImageData(px, px); b32 = new Uint32Array(img.data.buffer); }
+    buildPath();
+  }
+  function init() {
+    layout(); setShape(shape);
+    NG = W < 700 ? 9000 : 16000;
+    gx = new Float32Array(NG); gy = new Float32Array(NG); gt = new Uint8Array(NG); gb = new Uint8Array(NG); alive = new Uint8Array(NG);
+    for (let i = 0; i < NG; i++) { gb[i] = rand(150, 255); respawn(i, 0); }
+  }
+  // the drive: a list of {f, a} tones
+  function tones() {
+    if (micOn && mic) return micPeaks;
+    return TONES[toneIx].r.map(r => ({ f: freq * r, a: 1 }));
+  }
+  function drive(dt) {
+    const T = tones(); let best = 0, bi = -1;
+    const k = Math.min(1, dt * (micOn ? 14 : 20));
+    for (let j = 0; j < modes.length; j++) {
+      const md = modes[j]; let w = 0;
+      for (const t of T) w += t.a / (1 + ((t.f - md.f) / (md.f * .016)) ** 2);
+      w = Math.min(1, w);
+      const nw = MW[j] + (w - MW[j]) * k;
+      if (Math.abs(nw - MW[j]) > .004) dirty = true;
+      MW[j] = nw < .002 ? 0 : nw;
+      if (MW[j] > best) { best = MW[j]; bi = j; }
+    }
+    gain = best; near = bi >= 0 ? modes[bi] : null; nearW = best;
+    if (!dirty) return;
+    dirty = false; F.fill(0);
+    for (let j = 0; j < modes.length; j++) {
+      const w = MW[j]; if (w < .03) continue;
+      const a = fieldOf(modes[j]); for (let i = 0; i < a.length; i++) F[i] += a[i] * w;
     }
     let mx = 1e-6; for (let i = 0; i < F.length; i++) { const v = Math.abs(F[i]); if (v > mx) mx = v; F[i] = v; }
     for (let i = 0; i < F.length; i++) F[i] /= mx;
   }
-  function init() {
-    const B = bounds();
-    const S = Math.floor(Math.min(W - 32, B.bottom - B.top - 110));
-    plate = { x: Math.round((W - S) / 2), y: Math.round(B.top + 8 + (B.bottom - B.top - 110 - S) / 2), S };
-    NG = W < 700 ? 9000 : 16000;
-    gx = new Float32Array(NG); gy = new Float32Array(NG); gb = new Uint8Array(NG); alive = new Uint8Array(NG);
-    for (let i = 0; i < NG; i++) { gx[i] = Math.random(); gy[i] = Math.random(); gb[i] = rand(150, 255); alive[i] = 1; }
-    const px = Math.ceil(S * Math.min(DPR, 1.5));
-    oc = document.createElement('canvas'); oc.width = px; oc.height = px; octx = oc.getContext('2d');
-    img = octx.createImageData(px, px); b32 = new Uint32Array(img.data.buffer);
-    lastF = -1;
+  // our own little oscillator bank so chords sound like chords
+  function sound(T, level) {
+    const c = Snd.ctx; if (!c) return; const t = c.currentTime;
+    while (bank.length < 3) {
+      const o = c.createOscillator(), g = c.createGain(); o.type = 'sine'; g.gain.value = 0; o.connect(g).connect(Snd.master); o.start(); bank.push({ o, g });
+    }
+    for (let i = 0; i < 3; i++) {
+      const b = bank[i], tt = T[i];
+      if (tt && level > 0) { b.o.frequency.setTargetAtTime(tt.f, t, .02); b.g.gain.setTargetAtTime(level / Math.sqrt(T.length), t, .05); }
+      else b.g.gain.setTargetAtTime(0, t, .05);
+    }
+  }
+  function say(msg, ms) {
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);width:min(360px,calc(100% - 32px));background:rgba(30,20,28,.92);border:1px solid rgba(255,170,170,.35);color:#f1e4e8;border-radius:12px;padding:10px 12px;font:600 12.5px/1.4 system-ui,sans-serif;z-index:5;pointer-events:none;transition:opacity .4s;text-align:center';
+      document.body.appendChild(banner);
+    }
+    banner.style.top = (plate ? plate.y + 12 : 120) + 'px';
+    banner.textContent = msg; banner.style.opacity = 1; clearTimeout(bannerT);
+    bannerT = setTimeout(() => { if (banner) banner.style.opacity = 0; }, ms || 7000);
+  }
+  async function startMic() {
+    Snd.unlock();
+    const blocked = 'The microphone is blocked here. Browsers don’t allow the mic inside the claude.ai artifact preview — open Swirl Room from its Vercel or GitHub Pages address and sing, whistle or play music at the plate.';
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !Snd.ctx) { micOn = false; micErr = 'blocked'; say(blocked); return; }
+    micOn = true; micErr = '';
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      if (!micOn) { stream.getTracks().forEach(t => t.stop()); return; }
+      const c = Snd.ctx, src = c.createMediaStreamSource(stream), an = c.createAnalyser();
+      an.fftSize = 4096; an.smoothingTimeConstant = .5; src.connect(an); // never to the speakers
+      mic = { stream, src, an, buf: new Float32Array(an.frequencyBinCount) };
+      sound([], 0);
+      say('Listening. Sing, whistle or play music — the loudest pitches drive the plate.', 3500);
+    } catch (e) {
+      micOn = false; micErr = 'denied';
+      say(e && e.name === 'NotFoundError' ? 'No microphone was found on this device.' : blocked);
+    }
+  }
+  function stopMic() {
+    micOn = false; micPeaks = [];
+    if (mic) { try { mic.stream.getTracks().forEach(t => t.stop()); mic.src.disconnect(); } catch (e) {} mic = null; }
+  }
+  // strongest few spectral peaks between FMIN and FMAX, parabolic-interpolated
+  function listen() {
+    const { an, buf } = mic; an.getFloatFrequencyData(buf);
+    const bw = Snd.ctx.sampleRate / an.fftSize, lo = Math.ceil(FMIN / bw), hi = Math.min(buf.length - 2, FMAX / bw | 0);
+    const pk = [];
+    for (let i = lo; i <= hi; i++) { const v = buf[i]; if (v > -72 && v > buf[i - 1] && v >= buf[i + 1]) pk.push(i); }
+    pk.sort((a, b) => buf[b] - buf[a]);
+    const out = [], top = pk.length ? buf[pk[0]] : -200;
+    for (const i of pk) {
+      if (out.length >= 3) break;
+      const a = buf[i - 1], b = buf[i], c = buf[i + 1], d = .5 * (a - c) / (a - 2 * b + c || 1e-9), f = (i + clamp(d, -.5, .5)) * bw;
+      if (b < top - 18) break;
+      if (out.some(o => Math.abs(Math.log(o.f / f)) < .06)) continue; // skip a peak's own shoulders
+      out.push({ f, a: clamp((b + 72) / 30, 0, 1) * Math.pow(10, (b - top) / 40) });
+    }
+    micPeaks = out; spec = buf;
+    if (out.length) freq = out[0].f;
+  }
+  function checkDiscoveries(dt, T) {
+    // sample grains to see where they are sitting
+    let sN = 0, sNode = 0, pN = 0, pAnti = 0, al = 0;
+    for (let k = 0; k < 600; k++) {
+      const i = Math.random() * NG | 0; if (!alive[i]) continue; al++;
+      const f = F[cell(gx[i], gy[i])];
+      if (gt[i] === 2) { pN++; if (f > .55) pAnti++; } else { sN++; if (f < .14) sNode++; }
+    }
+    const res = gain > .6;
+    const nodeFrac = sN > 30 ? sNode / sN : 0, antiFrac = pN > 30 ? pAnti / pN : 0;
+    const formed = res && nodeFrac > .72;
+    holdT = formed ? holdT + dt : 0;
+    if (holdT > 1.2 && near) {
+      if (shape === 'Square') discover('cym', 'figure', 'Chladni figure', `Mode ${near.n},${near.m}: the sand is bounced off everything that moves and piles up on the lines that stand still.`);
+      if (shape === 'Circle' && near.m === 0) discover('cym', 'rings', 'Bullseye', 'A purely radial mode: the still lines are perfect circles.');
+      if (shape === 'Circle' && near.m >= 3) discover('cym', 'star', 'Star plate', `${near.m * 2} spokes: the circle is split into slices that move in turn.`);
+      if (shape === 'Violin') discover('cym', 'luthier', 'Tap tone', 'Violin makers sprinkle glitter on unfinished plates exactly like this, then carve until the figure is right.');
+      if ((near.n || 0) + (near.m || 0) >= 14 || near.k >= 5) discover('cym', 'lace', 'Lace', 'A high resonance: the plate breaks into dozens of tiny cells.');
+      if (micOn) discover('cym', 'voice', 'Voiceprint', 'Your sound drew that. The loudest pitch picked the resonance.');
+      if (T.length > 1 && modes.filter((m, j) => MW[j] > .45).length >= 2) discover('cym', 'chord', 'Interference', 'Two resonances at once: their shapes add, and only the places still in both keep the sand.');
+    }
+    if (res && antiFrac > .6) discover('cym', 'powder', 'Antinode dust', 'Light powder rides the air swirling off the plate and gathers where it shakes hardest, the opposite of sand.');
+    if (holdT > 1 && antiFrac > .5 && pN > 60 && sN > 60) discover('cym', 'sort', 'Sorted', 'Heavy grains to the still lines, light powder to the loud spots: the plate sorts a mixture.');
+    if (pouredOff > NG * .5) discover('cym', 'spill', 'Shaken off', 'Grains over a steep bit of plate got thrown clean off the edge.');
+    if (sweep && near && gain > .7 && !sweepSeen.has(near)) { sweepSeen.add(near); sweepN++; if (sweepN >= 12) discover('cym', 'sweep', 'Resonance ladder', 'A sweep lands on one resonance after another; the figures get finer as the pitch rises.'); }
   }
   const ctl = $('#ctl'), slider = $('#freq'), out = $('#freqOut');
-  const toSlider = f => Math.log(f / 60) / Math.log(2600 / 60) * 1000, fromSlider = v => 60 * Math.pow(2600 / 60, v / 1000);
-  slider.addEventListener('input', () => { freq = fromSlider(+slider.value); sweep = false; store.set('cymF', freq); });
+  const toSlider = f => Math.log(f / FMIN) / Math.log(FMAX / FMIN) * 1000, fromSlider = v => FMIN * Math.pow(FMAX / FMIN, v / 1000);
+  slider.addEventListener('input', () => { freq = fromSlider(+slider.value); sweep = false; if (micOn) stopMic(); store.set('cymF', freq); });
+  const COLS = [b => (b * .78 << 16) | (b * .9 << 8) | b, b => (Math.min(255, b + 40) << 16) | (Math.min(255, b * .95 + 30) << 8) | Math.min(255, b * .92 + 30), b => (b * .22 << 16) | (b * .84 << 8) | b];
   return {
-    name: 'Cymatics', canvas: '2d', hint: 'Slide the pitch. When it hits a resonance the sand jumps into a pattern. Touch the plate to pour more.',
+    name: 'Cymatics', canvas: '2d', hint: 'Slide the pitch, or tap Mic and sing. Touch the plate to pour the chosen grain.',
     enter() { if (!plate) init(); ctl.hidden = false; document.body.classList.add('has-ctl'); slider.value = toSlider(freq); },
-    leave() { ctl.hidden = true; document.body.classList.remove('has-ctl'); Snd.tone(0, 0); },
+    leave() { ctl.hidden = true; document.body.classList.remove('has-ctl'); stopMic(); sound([], 0); Snd.tone(0, 0); if (banner) banner.style.opacity = 0; },
     resize() { init(); },
     down(p) {},
     frame(dt, t) {
       if (!plate) init();
-      if (sweep) { freq *= Math.pow(1.045, dt * sweepDir); if (freq > 2500) sweepDir = -1; if (freq < 80) sweepDir = 1; slider.value = toSlider(freq); }
-      if (Math.abs(freq - lastF) > .01) compute();
-      // pour sand where the plate is touched
+      if (Math.abs(chipsEl.getBoundingClientRect().bottom - chipsBottom) > 2) layout();
+      if (sweep && !micOn) { freq *= Math.pow(1.045, dt * sweepDir); if (freq > FMAX - 100) sweepDir = -1; if (freq < 80) { sweepDir = 1; sweepSeen.clear(); sweepN = 0; } slider.value = toSlider(freq); }
+      if (micOn && mic) { listen(); slider.value = toSlider(freq); }
+      const T = tones();
+      drive(dt);
+      // pour the chosen grain where the plate is touched
       for (const p of P.values()) {
         const u = (p.x - plate.x) / plate.S, v = (p.y - plate.y) / plate.S;
         if (u < 0 || u > 1 || v < 0 || v > 1) continue;
         let k = 60;
-        for (let i = 0; i < NG && k > 0; i++) if (!alive[i]) { alive[i] = 1; gx[i] = u + rand(-.02, .02); gy[i] = v + rand(-.02, .02); k--; }
-        if (k > 0) for (let j = 0; j < k; j++) { const i = Math.random() * NG | 0; gx[i] = u + rand(-.02, .02); gy[i] = v + rand(-.02, .02); }
+        const put = i => { const x = u + rand(-.02, .02), y = v + rand(-.02, .02); if (x < 0 || x > 1 || y < 0 || y > 1 || !MASK[cell(x, y)]) return; gx[i] = x; gy[i] = y; gt[i] = grain; alive[i] = 1; };
+        for (let i = 0; i < NG && k > 0; i++) if (!alive[i]) { put(i); k--; }
+        for (let j = 0; j < k; j++) put(Math.random() * NG | 0);
+        pouredOff = 0;
       }
-      // every grain gets kicked in proportion to how hard its spot on the plate is shaking;
-      // grains only come to rest on the still (nodal) lines, so the lines draw themselves
       const amp = gain * gain, kick = .03 * amp + .0003;
       let moving = 0;
       for (let s = 0; s < 2; s++) for (let i = 0; i < NG; i++) {
         if (!alive[i]) continue;
-        const x = gx[i], y = gy[i];
-        const a = F[((y * (G - 1) + .5) | 0) * G + ((x * (G - 1) + .5) | 0)] * kick;
-        gx[i] = x + (Math.random() - .5) * a; gy[i] = y + (Math.random() - .5) * a;
-        if (gx[i] < 0 || gx[i] > 1 || gy[i] < 0 || gy[i] > 1) alive[i] = 0;
+        const x = gx[i], y = gy[i], c = cell(x, y), f = F[c], ty = gt[i];
+        let a;
+        if (ty === 2) {
+          // powder: drifts up the shaking gradient, jitters a little
+          const xi = c % G, yi = (c / G) | 0;
+          const dx = F[c + (xi < G - 1 ? 1 : 0)] - F[c - (xi > 0 ? 1 : 0)], dy = F[c + (yi < G - 1 ? G : 0)] - F[c - (yi > 0 ? G : 0)];
+          const d = .025 * amp;
+          gx[i] = x + dx * d + (Math.random() - .5) * (.012 * amp * (1.1 - f) + .0003);
+          gy[i] = y + dy * d + (Math.random() - .5) * (.012 * amp * (1.1 - f) + .0003);
+          a = d * (Math.abs(dx) + Math.abs(dy));
+        } else {
+          a = f * kick * (ty === 1 ? 1.25 : 1);
+          if (ty === 1 && f * amp < .06) a = 0; // salt crystals don't creep: they stick once the spot is quiet enough
+          gx[i] = x + (Math.random() - .5) * a; gy[i] = y + (Math.random() - .5) * a;
+        }
+        if (gx[i] < 0 || gx[i] > 1 || gy[i] < 0 || gy[i] > 1 || !MASK[cell(gx[i], gy[i])]) { alive[i] = 0; pouredOff++; }
         moving += a;
       }
-      Snd.tone(freq, .025 + .06 * gain);
+      if (!micOn) sound(T, .025 + .06 * gain); else sound([], 0);
       Snd.hiss(Math.min(moving * .08, .08), 5200);
+      checkDiscoveries(dt, T);
       // draw
       ctx.fillStyle = '#0c0d10'; ctx.fillRect(0, 0, W, H);
       const pp = plate, jig = gain > .5 ? (Math.random() - .5) * gain * 1.2 : 0;
       ctx.save(); ctx.translate(jig, 0);
       const mg = ctx.createLinearGradient(pp.x, pp.y, pp.x + pp.S, pp.y + pp.S);
-      mg.addColorStop(0, '#2b2e36'); mg.addColorStop(.5, '#1b1d23'); mg.addColorStop(1, '#262930');
-      ctx.fillStyle = mg; ctx.fillRect(pp.x, pp.y, pp.S, pp.S);
+      if (shape === 'Violin') { mg.addColorStop(0, '#4a2c18'); mg.addColorStop(.5, '#2e1b10'); mg.addColorStop(1, '#3d2414'); }
+      else { mg.addColorStop(0, '#2b2e36'); mg.addColorStop(.5, '#1b1d23'); mg.addColorStop(1, '#262930'); }
+      ctx.fillStyle = mg; ctx.fill(platePath);
+      if (shape === 'Violin') { // f-holes
+        ctx.fillStyle = '#0c0d10';
+        for (let k = 0; k < G; k++) for (let j = 0; j < G; j++) if (!MASK[k * G + j] && Math.abs(j / (G - 1) - .5) < violinW(k / (G - 1)) - .02) ctx.fillRect(pp.x + j / (G - 1) * pp.S - 1, pp.y + k / (G - 1) * pp.S - 1, pp.S / G + 1, pp.S / G + 1);
+      }
       const px = oc.width;
       b32.fill(0);
       for (let i = 0; i < NG; i++) {
         if (!alive[i]) continue;
-        const X = gx[i] * (px - 1) | 0, Y = gy[i] * (px - 1) | 0, idx = Y * px + X, b = gb[i];
+        const X = gx[i] * (px - 1) | 0, Y = gy[i] * (px - 1) | 0, idx = Y * px + X;
         const c = b32[idx]; const prev = c ? (c >>> 24) : 0, na = Math.min(255, prev + 110);
-        b32[idx] = (na << 24) | ((b * .78 | 0) << 16) | ((b * .9 | 0) << 8) | b;
+        b32[idx] = (na << 24) | COLS[gt[i]](gb[i]);
+        if (gt[i] === 2 && X < px - 1 && Y < px - 1) { const cc = (170 << 24) | COLS[2](gb[i]); if (!b32[idx + 1]) b32[idx + 1] = cc; if (!b32[idx + px]) b32[idx + px] = cc; }
       }
       octx.putImageData(img, 0, 0);
       ctx.drawImage(oc, pp.x, pp.y, pp.S, pp.S);
-      ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.strokeRect(pp.x + .5, pp.y + .5, pp.S - 1, pp.S - 1);
+      ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.stroke(platePath);
       ctx.fillStyle = '#4a4d57'; ctx.beginPath(); ctx.arc(pp.x + pp.S / 2, pp.y + pp.S / 2, 4, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
-      out.textContent = `${Math.round(freq)} Hz` + (gain > .55 && near ? ` · resonance ${near.n},${near.m}` : gain > .2 ? ' · close' : '');
+      // live spectrum under the plate while listening
+      if (micOn && spec && mic) {
+        const bw = Snd.ctx.sampleRate / mic.an.fftSize, y0 = pp.y + pp.S + 4, h = 22;
+        ctx.strokeStyle = 'rgba(160,200,255,.5)'; ctx.lineWidth = 1; ctx.beginPath();
+        for (let x = 0; x <= pp.S; x += 2) { const f = FMIN * Math.pow(FMAX / FMIN, x / pp.S), v = clamp((spec[Math.round(f / bw)] + 100) / 70, 0, 1); ctx.lineTo(pp.x + x, y0 + h - v * h); }
+        ctx.stroke();
+        ctx.fillStyle = '#ffd84a';
+        for (const pk of micPeaks) { const x = pp.x + Math.log(pk.f / FMIN) / Math.log(FMAX / FMIN) * pp.S; ctx.fillRect(x - 1, y0, 2, h); }
+      }
+      const found = discovered('cym');
+      let label;
+      if (micOn) label = mic ? (micPeaks.length ? 'Mic · ' + micPeaks.map(p => Math.round(p.f)).join(' + ') + ' Hz' : 'Mic · listening…') : 'Mic · asking…';
+      else label = T.map(x => Math.round(x.f)).join(' + ') + ' Hz';
+      out.textContent = label + (gain > .55 && near ? (near.kind === 'sq' ? ` · ${near.n},${near.m}` : ` · ring ${near.m},${near.k}`) : gain > .2 ? ' · close' : '') + (found ? ` · ${found}/11 found` : '');
     },
     chips() {
       return [
-        { label: 'Sweep', on: sweep, act() { sweep = !sweep; } },
-        { label: 'Next resonance', act() { const nx = MODES.find(m => m.f > freq * 1.02) || MODES[0]; freq = nx.f; sweep = false; slider.value = toSlider(freq); store.set('cymF', freq); } },
-        { label: 'Scatter sand', act() { for (let i = 0; i < NG; i++) { gx[i] = Math.random(); gy[i] = Math.random(); alive[i] = 1; } } }
+        { label: shape, act() { setShape(SHAPES[(SHAPES.indexOf(shape) + 1) % SHAPES.length]); } },
+        { label: GRAINS[grain], act() { grain = (grain + 1) % GRAINS.length; } },
+        { label: TONES[toneIx].label, act() { toneIx = (toneIx + 1) % TONES.length; if (micOn) stopMic(); } },
+        { label: 'Mic', on: micOn, act() { if (micOn) stopMic(); else startMic(); } },
+        { label: 'Sweep', on: sweep, act() { sweep = !sweep; if (micOn) stopMic(); sweepSeen.clear(); sweepN = 0; } },
+        { label: 'Next', act() { if (micOn) stopMic(); const nx = modes.find(m => m.f > freq * 1.02) || modes[0]; freq = nx.f; sweep = false; slider.value = toSlider(freq); store.set('cymF', freq); } },
+        { label: 'Scatter', act() { for (let i = 0; i < NG; i++) respawn(i, alive[i] ? gt[i] : grain); pouredOff = 0; } }
       ];
     }
   };
