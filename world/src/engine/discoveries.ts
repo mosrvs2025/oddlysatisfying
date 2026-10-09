@@ -91,6 +91,17 @@ export const DISCOVERIES: Discovery[] = [
   { id: 'decompose', group: 'Life', name: 'Decay', text: 'Fungus digests wood.' },
   { id: 'fungus-light', group: 'Life', name: 'Sunburn', text: 'Fungus dies in the light.' },
   { id: 'swamp-gas', group: 'Life', name: 'Swamp gas', text: 'Rotting fungus breathes out methane.', unlocks: [M.Methane] },
+  // evolution
+  { id: 'mutate', group: 'Evolution', name: 'Mutation', text: 'Radiation scrambles the genes of living things; their children inherit the change.' },
+  { id: 'evo-coat', group: 'Evolution', name: 'Thick coat', text: 'Bugs bred in the cold grow fur that survives hard frost.' },
+  { id: 'evo-swim', group: 'Evolution', name: 'Swimmers', text: 'Bugs that live near water evolve to breathe and paddle in it.' },
+  { id: 'evo-heat', group: 'Evolution', name: 'Warm-blooded', text: 'Fish bred in warm water learn to live in it.' },
+  { id: 'evo-lungs', group: 'Evolution', name: 'Lungfish', text: 'Fish that gulp air at the surface evolve lungs.' },
+  { id: 'evo-walk', group: 'Evolution', name: 'Walking fish', text: 'Strong lungs let a fish crawl out of the water and hunt on land.' },
+  { id: 'evo-giant', group: 'Evolution', name: 'Giants', text: 'Generations of plants reaching for light grow enormous.' },
+  { id: 'evo-hardy', group: 'Evolution', name: 'Evergreen', text: 'Plants whose seeds fell in the cold survive frost that kills their ancestors.' },
+  { id: 'evo-fast', group: 'Evolution', name: 'Runaway bloom', text: 'Fast algae choke a pond.' },
+  { id: 'evo-deep', group: 'Evolution', name: 'Deep algae', text: 'Algae pushed into shade learn to grow in the dark.' },
   // weather & forces
   { id: 'wind-blown', group: 'Weather', name: 'Drift', text: 'Wind carries light powders like ash, snow and seeds.' },
   { id: 'waves', group: 'Weather', name: 'Waves', text: 'Wind pushes water around.' },

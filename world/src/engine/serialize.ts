@@ -1,4 +1,5 @@
 import { World } from './world.ts';
+import { M, PHASE, Phase } from './materials.ts';
 
 export interface Snapshot { mat: Uint8Array; aux: Uint8Array; life: Uint8Array; flags: Uint8Array; vel: Int8Array; temp: Float32Array; charge: Uint8Array; rng: number; tick: number }
 
@@ -51,4 +52,29 @@ export async function fromCode(code: string) {
   const bin = atob(code.trim()), z = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) z[i] = bin.charCodeAt(i);
   return decode(await pipe(z, new DecompressionStream('deflate-raw')));
+}
+
+/**
+ * Re-cut a world to a new grid size, e.g. when a phone is turned from portrait to landscape.
+ * The ground stays on the ground (the typical surface row lands about 58% of the way down), columns are centred,
+ * and anything beyond the old edges is a mirror image so rivers and hills carry on naturally.
+ */
+export function reshape(src: World, w: number, h: number): World {
+  const out = new World(w, h, src.seed);
+  out.rngState = src.rngState; out.tick = src.tick;
+  const tops: number[] = [];
+  for (let x = 0; x < src.w; x++) for (let y = 0; y < src.h; y++) { const m = src.mat[y * src.w + x]; if (m !== M.Empty && PHASE[m] !== Phase.Gas) { tops.push(y); break; } }
+  tops.sort((a, b) => a - b);
+  const dy = tops.length ? Math.round(h * .58 - tops[tops.length >> 1]) : h - src.h;
+  const dx = Math.floor((w - src.w) / 2), period = src.w * 2;
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(src.h - 1, y - dy);
+    if (sy < 0) continue;
+    for (let x = 0; x < w; x++) {
+      let sx = (((x - dx) % period) + period) % period; if (sx >= src.w) sx = period - 1 - sx;
+      const i = y * w + x, j = sy * src.w + sx;
+      out.mat[i] = src.mat[j]; out.aux[i] = src.aux[j]; out.life[i] = src.life[j]; out.flags[i] = src.flags[j]; out.vel[i] = src.vel[j]; out.temp[i] = src.temp[j];
+    }
+  }
+  return out;
 }

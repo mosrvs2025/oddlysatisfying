@@ -1,6 +1,6 @@
 import { World, F } from '../src/engine/world.ts';
 import { M } from '../src/engine/materials.ts';
-import { lightning, bomb, wind, storm } from '../src/engine/tools.ts';
+import { lightning, bomb, wind, storm, mutate } from '../src/engine/tools.ts';
 
 // One small, hand-built world per discovery. Each proves the reaction emerges from the rules:
 // nothing here calls world.find() directly.
@@ -99,6 +99,19 @@ export const SCENARIOS: Scenario[] = [
   { id: 'fish-suffocate', ticks: 600, setup: w => { floor(w); set(w, 15, 27, M.Fish); } },
   { id: 'fish-cooked', ticks: 60, setup: w => { floor(w); rect(w, 5, 24, 25, 28, M.Water, 80); set(w, 15, 26, M.Fish); } },
   { id: 'fish-starve', ticks: 4000, setup: w => { floor(w); rect(w, 5, 20, 25, 28, M.Water); set(w, 15, 26, M.Fish); } },
+  // evolution: founders carry a nearly-adapted genome (coat 7, swim 7 and so on) so a handful of births is enough to cross the threshold
+  { id: 'mutate', ticks: 200, setup: w => { floor(w); rect(w, 5, 27, 25, 28, M.Plant); }, each: w => mutate(w, 15, 27, 8) },
+  { id: 'evo-coat', ticks: 3000, setup: w => { w.mutation = 3; floor(w); rect(w, 3, 22, 27, 28, M.Plant); rect(w, 10, 21, 12, 21, M.Bug); for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Bug) w.aux[i] = 7; },
+    each: w => { if (w.tick % 5 === 0) for (let i = 20 * w.w; i < w.n; i++) w.temp[i] = 4; } },
+  { id: 'evo-swim', ticks: 3000, setup: w => { w.mutation = 3; floor(w); rect(w, 3, 18, 27, 28, M.Water); rect(w, 3, 22, 27, 27, M.Plant); rect(w, 10, 20, 12, 21, M.Bug); for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Bug) w.aux[i] = 0x70; } },
+  { id: 'evo-heat', ticks: 5000, setup: w => { w.mutation = 3; floor(w); rect(w, 0, 18, 29, 28, M.Water); rect(w, 0, 18, 29, 28, M.Algae); for (let y = 18; y < 29; y += 2) for (let x = 0; x < 30; x += 2) set(w, x, y, M.Water); set(w, 15, 24, M.Fish); for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Fish) w.aux[i] = 7; },
+    each: w => { if (w.tick % 5 === 0) for (let i = 18 * w.w; i < w.n; i++) w.temp[i] = 30; } },
+  { id: 'evo-lungs', ticks: 6000, setup: w => { w.mutation = 3; floor(w); rect(w, 0, 18, 29, 28, M.Water); rect(w, 0, 18, 29, 28, M.Algae); for (let y = 18; y < 29; y += 2) for (let x = 0; x < 30; x += 2) set(w, x, y, M.Water); set(w, 15, 18, M.Fish); for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Fish) w.aux[i] = 0x70; } },
+  { id: 'evo-walk', ticks: 6000, setup: w => { w.mutation = 3; floor(w); rect(w, 0, 18, 29, 28, M.Water); rect(w, 0, 18, 29, 28, M.Algae); for (let y = 18; y < 29; y += 2) for (let x = 0; x < 30; x += 2) set(w, x, y, M.Water); set(w, 15, 18, M.Fish); for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Fish) w.aux[i] = 0xb0; } },
+  { id: 'evo-giant', ticks: 4000, setup: w => { w.mutation = 2; floor(w); set(w, 15, 20, M.Plant); w.aux[20 * w.w + 15] = 10; }, each: w => { const i = 20 * w.w + 15; if (w.tick === 1) w.flags[i] = F.FLOWER; if (w.mat[i] === M.Plant) w.life[i] = 200; } },
+  { id: 'evo-hardy', ticks: 4000, setup: w => { w.mutation = 2; floor(w); set(w, 15, 20, M.Plant); w.aux[20 * w.w + 15] = 0x70; }, each: w => { const i = 20 * w.w + 15; if (w.tick === 1) w.flags[i] = F.FLOWER; if (w.mat[i] === M.Plant) { w.life[i] = 200; w.temp[i] = 0; } } },
+  { id: 'evo-fast', ticks: 3000, setup: w => { w.mutation = 2; floor(w); rect(w, 0, 20, 29, 28, M.Water); set(w, 15, 22, M.Algae); w.aux[22 * w.w + 15] = 7; } },
+  { id: 'evo-deep', ticks: 3000, setup: w => { w.mutation = 3; floor(w); rect(w, 0, 20, 29, 28, M.Water); rect(w, 0, 17, 14, 18, M.Stone); set(w, 14, 22, M.Algae); w.aux[22 * w.w + 14] = 0x70; } },
   { id: 'waves', ticks: 60, setup: w => { floor(w); rect(w, 3, 24, 27, 28, M.Water); }, each: w => wind(w, 10, 23, 6, 1.5, 0) },
 ];
 
