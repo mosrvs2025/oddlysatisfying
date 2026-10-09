@@ -90,3 +90,45 @@ test('oil painted into the bottom of a pond displaces the water and floats to th
   let deepOil = 0; for (let y = 25; y < 40; y++) for (let x = 0; x < 30; x++) if (w.mat[y * 30 + x] === M.Oil) deepOil++;
   assert.ok(deepOil <= 1, `${deepOil} oil cells still deep underwater`);
 });
+test('natural selection: in the cold only furry bugs survive, and their children inherit the coat', () => {
+  const w = new World(60, 30, 5);
+  for (let x = 0; x < 60; x++) w.spawn(29 * 60 + x, M.Wall);
+  for (let y = 22; y < 29; y++) for (let x = 3; x < 57; x++) w.spawn(y * 60 + x, M.Plant);
+  for (let k = 0; k < 48; k++) { const i = 21 * 60 + 5 + k; w.spawn(i, M.Bug); w.aux[i] = k % 16; }
+  for (let t = 0; t < 1500; t++) { if (t % 5 === 0) for (let i = 18 * 60; i < w.n; i++) w.temp[i] = -16; w.step(); }
+  let n = 0, sum = 0;
+  for (let i = 0; i < w.n; i++) if (w.mat[i] === M.Bug) { n++; sum += w.aux[i] & 15; }
+  assert.ok(n > 0, 'every bug died');
+  assert.ok(sum / n >= 5, `survivors averaged coat ${(sum / n).toFixed(1)}; the unfit should have died`);
+});
+test('genes are inherited by children, with the odd change', () => {
+  const w = new World(10, 10, 3); w.mutation = 4;
+  let same = 0, diff = 0;
+  for (let k = 0; k < 400; k++) (w.inherit(0x58) === 0x58 ? same++ : diff++);
+  assert.ok(same > 100 && diff > 50, `same ${same} diff ${diff}`);
+  for (let k = 0; k < 400; k++) { const g = w.inherit(0xf0, true, true); assert.ok((g & 15) <= 15 && (g >> 4) <= 15); }
+});
+test('the mutate tool changes genes only in living things', async () => {
+  const { mutate } = await import('../src/engine/tools.ts');
+  const w = new World(30, 30, 2);
+  for (let x = 5; x < 25; x++) { w.spawn(10 * 30 + x, M.Bug); w.aux[10 * 30 + x] = 0x33; w.spawn(11 * 30 + x, M.Sand); w.aux[11 * 30 + x] = 0x33; }
+  for (let t = 0; t < 40; t++) mutate(w, 15, 10, 12);
+  let bugChanged = 0, sandChanged = 0;
+  for (let x = 5; x < 25; x++) { if (w.aux[10 * 30 + x] !== 0x33) bugChanged++; if (w.aux[11 * 30 + x] !== 0x33) sandChanged++; }
+  assert.ok(bugChanged > 10); assert.equal(sandChanged, 0);
+});
+test('reshaping keeps the ground on the ground and the sky above it', async () => {
+  const { reshape } = await import('../src/engine/serialize.ts');
+  const w = new World(100, 200, 4);
+  for (let y = 120; y < 200; y++) for (let x = 0; x < 100; x++) w.spawn(y * 100 + x, y > 180 ? M.Stone : M.Dirt);
+  for (let x = 40; x < 60; x++) for (let y = 110; y < 120; y++) w.spawn(y * 100 + x, M.Water);
+  const r = reshape(w, 220, 90);
+  assert.equal(r.w, 220); assert.equal(r.h, 90);
+  const surface = (x: number) => { for (let y = 0; y < 90; y++) if (r.mat[y * 220 + x]) return y; return -1; };
+  const s = surface(5);
+  assert.ok(s > 25 && s < 70, `ground at row ${s} of 90`);
+  assert.equal(r.mat[89 * 220 + 110], M.Dirt);
+  let water = 0; for (let i = 0; i < r.n; i++) if (r.mat[i] === M.Water) water++;
+  assert.ok(water > 0, 'the pond was lost');
+  for (let t = 0; t < 30; t++) r.step();   // and it still runs
+});

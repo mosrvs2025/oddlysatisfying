@@ -29,10 +29,20 @@ To run locally: `./scripts/build.sh` then open `_site/index.html`.
 
 ## Terrarium (world simulator)
 
-The Sand tab has a **Terrarium ✦** chip that opens a full world simulator: 29 materials with temperature,
-phase changes, combustion, air pressure and wind, electricity, plants, fungus and bugs, 74 discoverable
-reactions, god tools (heat, freeze, wind, rain, lightning, blast, gravity, local time), undo, save slots,
+The Sand tab has a **Terrarium ✦** chip that opens a full world simulator: 31 materials with temperature,
+phase changes, combustion, air pressure and wind, electricity, plants, fungus, bugs, fish and algae, 96 discoverable
+phenomena, god tools (heat, freeze, wind, rain, lightning, blast, gravity, local time, **mutate**), undo, save slots,
 share codes and debug views. Open it directly with `#terrarium`.
+
+**Evolution.** Bugs, fish, plants and algae each carry two heritable genes (shown in their colour). Children copy them
+with the odd mutation and the environment does the selecting: bugs bred in the cold grow thick coats, fish in warm water
+tolerate heat, fish that gulp air at the surface grow lungs and eventually crawl onto land, plants in the cold harden to
+frost, algae pushed into shade learn to live in the dark. The Mutate tool scrambles genes under your finger, and the DNA
+button opens a live view of every species' gene pool.
+
+**Phones.** On a phone held sideways the tools move to a left rail and the materials to a right rail, leaving the middle for
+the world. Rotating the phone re-cuts the world to the new shape, the world autosaves (and is restored after a crash or a
+browser-reclaimed graphics context), and a crash in the simulation rolls back to the last good moment instead of freezing.
 
 Source lives in `world/` (TypeScript engine + WebGL2 renderer). To change it:
 

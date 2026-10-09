@@ -54,6 +54,18 @@ void main(){
     if (up < .5) col = mix(col, vec3(1.), .22);
     a = .92;
   }
+  // genes tint living things so adaptations are visible: low nibble = trait A, high nibble = trait B
+  if (m == 19 || m == 30 || m == 16 || m == 31 || m == 17) {
+    int g = int(aux * 255. + .5); float ga = float(g & 15) / 15., gb = float(g >> 4) / 15.;
+    vec3 base = pal.rgb;
+    if (m == 19) base = mix(mix(base, vec3(.96, .92, .84), ga * .9), vec3(.15, .75, .95), gb * .75);              // furry, swimming
+    else if (m == 30) base = mix(mix(base, vec3(.9, .1, .3), ga * .75), vec3(.35, .62, .22), gb * .8);            // heat proof, lunged
+    else if (m == 16) base = mix(mix(base, vec3(.35, .85, .5), ga * .6), vec3(.1, .38, .42), gb * .7);            // tall, frost proof
+    else if (m == 31) base = mix(mix(base, vec3(.62, .95, .25), ga * .8), vec3(.1, .28, .55), gb * .8);           // fast, deep
+    else base = mix(base, base * vec3(.9, 1.1, .9), ga) * (.8 + .3 * gb);
+    col = base * (1. + (hash(c) - .5) * variance * .8);
+    if (up < .5) col *= 1.14;
+  }
   // gases are drawn as a soft density field so smoke and steam read as clouds, not static
   if (phase == 4 || m == 0) {
     vec3 gc = vec3(0.); float ga = 0., tot = 0.;
@@ -250,8 +262,18 @@ export class Renderer {
     return { fb, tex, w, h };
   }
 
+  /** Release the per-world textures and framebuffers; without this every new world leaked GPU memory until the browser dropped the context. */
+  private freeWorld() {
+    const gl = this.gl;
+    for (const t of [this.state, this.airTex]) if (t) gl.deleteTexture(t);
+    for (const t of [this.scene, this.half, this.halfB, this.quarter, this.quarterB]) if (t) { gl.deleteFramebuffer(t.fb); for (const x of t.tex) gl.deleteTexture(x); }
+    for (const t of [this.colTex, this.colTex2]) if (t) gl.deleteTexture(t);
+    this.colTex = this.colTex2 = null; this.cols = new Uint8Array(0);
+  }
   setWorld(world: World) {
-    const gl = this.gl; this.world = world;
+    const gl = this.gl;
+    if (this.world) this.freeWorld();
+    this.world = world;
     const w = world.w, h = world.h;
     this.stateBuf = new Uint8Array(w * h * 4);
     this.state = this.tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
@@ -261,6 +283,7 @@ export class Renderer {
     const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1), qw = Math.max(1, w >> 2), qh = Math.max(1, h >> 2);
     this.half = this.target(hw, hh, 1, gl.LINEAR); this.halfB = this.target(hw, hh, 1, gl.LINEAR);
     this.quarter = this.target(qw, qh, 1, gl.LINEAR); this.quarterB = this.target(qw, qh, 1, gl.LINEAR);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   private upload() {
@@ -301,6 +324,10 @@ export class Renderer {
       this.embers.push({ x: sp[k] + .5, y: sp[k + 1] + .5, vx: (Math.random() - .5) * .6, vy: -Math.random() * .8 - .2, life: 1, r: hot ? .6 : 1, g: hot ? 1 : .55, b: hot ? 1.2 : .15 });
     }
     sp.length = 0;
+    const gl = W.gleams;
+    for (let k = 0; k + 1 < gl.length && this.embers.length < 700; k += 2) for (let q = 0; q < 2; q++)
+      this.embers.push({ x: gl[k] + .5, y: gl[k + 1] + .5, vx: (Math.random() - .5) * .9, vy: -Math.random() * .9 - .1, life: 1, r: .45, g: 1.1, b: .35 });
+    gl.length = 0;
     for (const e of this.embers) {
       e.x += e.vx; e.y += e.vy;
       e.vx += W.air.vxAt(Math.max(0, Math.min(W.w - 1, e.x | 0)), Math.max(0, Math.min(W.h - 1, e.y | 0))) * .05;
@@ -309,6 +336,7 @@ export class Renderer {
     this.embers = this.embers.filter(e => e.life > 0);
   }
 
+  private shockData = new Float32Array(32); private stormData = new Float32Array(16);
   private time = 0;
   private renderSphere(time: number) {
     const gl = this.gl, W = this.world;
@@ -330,14 +358,15 @@ export class Renderer {
     gl.uniform2f(u.uScreen, this.canvas.width, this.canvas.height);
     gl.uniform3f(u.uCenter, S.cx * dpr, S.cy * dpr, S.r * dpr);
     gl.uniform1f(u.uYaw, S.yaw); gl.uniform1f(u.uTilt, S.tilt); gl.uniform1f(u.uTime, time);
-    const sd = new Float32Array(16); let ns = 0;
+    const sd = this.stormData; sd.fill(0); let ns = 0;
     for (const s of W.storms) { if (ns >= 4) break; sd.set([s.x / W.w, Math.min(.5, .05 + s.r / W.w * 5), s.spin, Math.min(1, s.life / 120)], ns * 4); ns++; }
     gl.uniform4fv(u.uStorm, sd); gl.uniform1i(u.uStorms, ns);
     this.draw();
   }
   render(cam: Camera, time: number) {
     this.time = time;
-    if (this.sphere.on) { this.world.sparks.length = 0; this.renderSphere(time); return; }
+    if (this.sphere.on) { this.world.sparks.length = 0; this.world.gleams.length = 0; this.renderSphere(time); return; }
+    if (this.gl.isContextLost()) return;
     const gl = this.gl, W = this.world;
     this.upload();
     this.spawnEmbers(time);
@@ -353,6 +382,7 @@ export class Renderer {
     u = this.use('down');
     this.bind(this.half); this.texUnit(u.uTex, 0, this.scene.tex[1]); gl.uniform2f(u.uTexel, 1 / W.w, 1 / W.h); this.draw();
     this.blurInto(this.half, this.halfB, 2);
+    u = this.use('down');   // blurInto switched programs; the uniform locations below belong to 'down'
     this.bind(this.quarter); this.texUnit(u.uTex, 0, this.half.tex[0]); gl.uniform2f(u.uTexel, 1 / this.half.w, 1 / this.half.h); this.draw();
     this.blurInto(this.quarter, this.quarterB, 4);
     // 3. composite
@@ -363,7 +393,7 @@ export class Renderer {
     const dpr = this.canvas.width / Math.max(1, this.canvas.clientWidth);
     gl.uniform3f(u.uCam, cam.x, cam.y, cam.zoom * dpr); gl.uniform1f(u.uTime, time);
     gl.uniform1f(u.uAmbient, this.view === 'normal' ? this.ambient : 1);
-    const sh = new Float32Array(32); let ns = 0;
+    const sh = this.shockData; sh.fill(0); let ns = 0;
     for (const s of W.shocks) { if (ns >= 8) break; const k = s.t / 40; sh.set([s.x, s.y, s.r * (1 + s.t * .9), (1 - k) * Math.min(1, s.r / 6)], ns * 4); ns++; }
     gl.uniform4fv(u.uShock, sh); gl.uniform1i(u.uShocks, ns);
     this.planetUniforms(u, dpr);

@@ -1,8 +1,8 @@
-import { World } from './world.ts';
+import { World, GENETIC } from './world.ts';
 import { M, MATS, PHASE, Phase, CONDUCTIVE } from './materials.ts';
 
 /** Every way a player can touch the world. All of them go through the same deterministic RNG. */
-export type ToolId = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time' | 'storm';
+export type ToolId = 'paint' | 'erase' | 'heat' | 'cool' | 'wind' | 'bolt' | 'bomb' | 'rain' | 'gravity' | 'time' | 'storm' | 'mutate';
 
 export function disc(world: World, cx: number, cy: number, r: number, f: (i: number, x: number, y: number, d: number) => void) {
   const R = Math.max(0, r), r2 = (R + .5) * (R + .5);
@@ -114,4 +114,17 @@ export function lightning(world: World, x: number, y: number) {
     if (CONDUCTIVE[m] > 0) { world.charge[i] = 1; world.eLive = true; }
   });
   world.explode(hx, hy, 3, 300);
+}
+
+/** Radiation: scrambles the genes of living things under the brush so their children may differ. Selection does the rest. */
+export function mutate(world: World, x: number, y: number, r: number) {
+  disc(world, x, y, r, (i, cx, cy) => {
+    if (!GENETIC[world.mat[i]] || world.rnd() % 10 !== 0) return;
+    const g = world.aux[i], step = () => (world.rnd() % 5) - 2;
+    const a = Math.max(0, Math.min(15, (g & 15) + step())), b = Math.max(0, Math.min(15, (g >> 4) + step()));
+    world.aux[i] = a | (b << 4);
+    world.evolved(world.mat[i], world.aux[i]);
+    if (world.gleams.length < 80) world.gleams.push(cx, cy);
+    world.find('mutate');
+  });
 }

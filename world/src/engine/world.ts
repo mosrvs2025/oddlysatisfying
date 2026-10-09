@@ -14,6 +14,8 @@ export interface Bolt { pts: number[]; t: number }
 const N8X = [-1, 0, 1, -1, 1, -1, 0, 1], N8Y = [-1, -1, -1, 0, 0, 1, 1, 1];
 const N4X = [0, -1, 1, 0], N4Y = [-1, 0, 0, 1];
 
+export const GENETIC = new Uint8Array(MAT_COUNT);
+for (const g of [M.Bug, M.Fish, M.Plant, M.Seed, M.Algae]) GENETIC[g] = 1;
 const BURN_FIND: Record<number, string> = { [M.Plant]: 'plant-burn', [M.Fungus]: 'fungus-burn', [M.Bug]: 'bug-burn', [M.Seed]: 'seed-burn' };
 
 /**
@@ -35,6 +37,10 @@ export class World {
   /** Spinning storms. They live on their own once started: drift with the wind, lift what they pass over, and spin down. */
   storms: { x: number; y: number; r: number; life: number; spin: number }[] = [];
   stats = { explosions: 0 };
+  /** Evolution: chance of a random gene change is 1 in this per trait per birth. Radiation (the Mutate tool) acts directly. */
+  mutation = 10;
+  /** Cells where a gene just changed, for the renderer to flash. */
+  gleams: number[] = [];
 
   constructor(w: number, h: number, seed = 1) {
     this.w = w; this.h = h; this.n = w * h;
@@ -54,6 +60,16 @@ export class World {
   rf() { return this.rnd() / 4294967296; }
   get rngState() { return this.s; } set rngState(v: number) { this.s = v >>> 0 || 1; }
 
+  /** Report a newborn whose genes have crossed into a new adaptation. */
+  evolved(m: number, g: number) {
+    const a = g & 15, b = g >> 4;
+    switch (m) {
+      case M.Bug: if (a >= 8) this.find('evo-coat'); if (b >= 8) this.find('evo-swim'); break;
+      case M.Fish: if (a >= 8) this.find('evo-heat'); if (b >= 8) this.find('evo-lungs'); if (b >= 12) this.find('evo-walk'); break;
+      case M.Plant: if (a >= 11) this.find('evo-giant'); if (b >= 8) this.find('evo-hardy'); break;
+      case M.Algae: if (a >= 8) this.find('evo-fast'); if (b >= 8) this.find('evo-deep'); break;
+    }
+  }
   find(id: string) { if (!this.found.has(id)) { this.found.add(id); this.newFinds.push(id); } }
 
   // ---------- cell helpers ----------
@@ -61,11 +77,28 @@ export class World {
   inside(x: number, y: number) { return x >= 0 && y >= 0 && x < this.w && y < this.h; }
   /** Put a fresh cell of material m at i (painting, spawning). */
   spawn(i: number, m: number, t?: number) {
-    this.mat[i] = m; this.aux[i] = this.rnd() & 255; this.flags[i] = 0; this.vel[i] = 0; this.charge[i] = 0;
+    this.mat[i] = m; this.aux[i] = GENETIC[m] ? this.baseGenome(m) : this.rnd() & 255; this.flags[i] = 0; this.vel[i] = 0; this.charge[i] = 0;
     this.life[i] = this.initLife(m);
     const d = MATS[m];
     this.temp[i] = t ?? d.startTemp ?? this.ambient[(i / this.w) | 0];
     this.clk[i] = this.gen;
+  }
+  /**
+   * Genes live in the aux byte of living cells: two 4-bit traits (low nibble, high nibble), see genes.ts.
+   * A fresh founder gets a small random genome; children copy a parent's with the odd mutation.
+   */
+  baseGenome(m: number) {
+    const r = () => this.rnd() % 4;
+    return m === M.Plant || m === M.Seed ? (2 + (this.rnd() % 3)) | (r() << 4) : r() | (r() << 4);
+  }
+  mutNibble(v: number, pressure: boolean) {
+    if (this.rnd() % (pressure ? 4 : this.mutation) !== 0) return v;
+    const d = pressure ? 1 : (this.rnd() & 1) ? 1 : -1, big = this.rnd() % 12 === 0 ? 2 : 1;
+    return Math.max(0, Math.min(15, v + d * big));
+  }
+  /** Genome for a child. `pa` / `pb` say the environment is pushing that trait up (cold for a coat, shade for light-hunger). */
+  inherit(parent: number, pa = false, pb = false) {
+    return this.mutNibble(parent & 15, pa) | (this.mutNibble(parent >> 4, pb) << 4);
   }
   /** Turn the cell at i into material m, keeping its heat. */
   become(i: number, m: number) {
@@ -499,7 +532,7 @@ export class World {
       const fert = this.flags[b] & F.FERT;
       this.flags[b] &= ~F.WET;
       this.become(i, M.Plant); this.flags[i] = F.TIP; this.life[i] = fert ? 160 : 90; this.vel[i] = 0;
-      this.aux[i] = fert ? 200 + (this.aux[i] % 55) : this.aux[i] % 200; // aux doubles as the plant's genetic height
+      if (fert) this.aux[i] = (this.aux[i] & 0xf0) | Math.min(15, (this.aux[i] & 15) + 4); // rich soil: a taller start
       this.find('sprout');
       return true;
     }
@@ -507,7 +540,8 @@ export class World {
   }
   plant(i: number, x: number, y: number) {
     const f = this.flags[i], w = this.w;
-    if (this.temp[i] < -4) { this.become(i, M.Dirt); this.find('frostbite'); return; }
+    const hardy = this.aux[i] >> 4;
+    if (this.temp[i] < -4 - hardy * 3) { this.become(i, M.Dirt); this.find('frostbite'); return; }
     if (IGNITE[M.Plant] < 1e8 && this.combust(i, x, y, M.Plant)) return;
     if (f & F.BURN) return;
     // drink from neighbours
@@ -521,10 +555,10 @@ export class World {
       else if (t === M.Plant && n < i + 2 && this.life[i] > this.life[n] + 2) { const d = (this.life[i] - this.life[n]) >> 1; this.life[i] -= d; this.life[n] += d; }
     }
     if (f & F.TIP) {
-      if (!this.one(6)) return;
+      if (!this.one(6 + (hardy >> 1))) return;   // a hardy plant grows slower
       if (this.life[i] < 10) return;
       if (!this.lit(i)) { this.find('phototropism'); return; }
-      const maxH = 14 + (this.aux[i] % 30) + ((this.aux[i] > 200) ? 18 : 0);
+      const maxH = 10 + (this.aux[i] & 15) * 4;
       if (this.vel[i] >= maxH) { this.flags[i] = F.FLOWER; this.find('bloom'); return; }
       const r = this.rnd() % 10, dx = r < 6 ? 0 : r < 8 ? -1 : 1;
       const nx = x + dx, ny = y - 1;
@@ -543,7 +577,10 @@ export class World {
     if ((f & F.FLOWER) && this.life[i] >= 16 && this.one(90)) {
       const k = this.rnd() & 7, nx = x + N8X[k], ny = y + N8Y[k];
       if (nx >= 0 && ny >= 0 && nx < w && ny < this.h && this.mat[ny * w + nx] === M.Empty) {
-        this.spawn(ny * w + nx, M.Seed); this.life[i] -= 16; this.find('reproduce');
+        const k = ny * w + nx;
+        this.spawn(k, M.Seed); this.life[i] -= 16; this.find('reproduce');
+        this.aux[k] = this.inherit(this.aux[i], false, this.temp[i] < 2);  // a cold season favours hardier seed
+        this.evolved(M.Plant, this.aux[k]);
       }
     }
   }
@@ -561,12 +598,20 @@ export class World {
     const w = this.w, h = this.h;
     const T = this.temp[i];
     if (T > 60 && !(this.flags[i] & F.BURN)) { this.become(i, M.Ash); this.find('bug-burn'); return; }
-    if (T < -5) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('bug-cold'); return; }
+    const coat = this.aux[i] & 15, swim = this.aux[i] >> 4;
+    if (T < -5 - coat * 3) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('bug-cold'); return; }
     if (this.combust(i, x, y, M.Bug)) return;
     if (!this.one(2)) return;
-    // submerged bugs run out of air
+    // submerged bugs run out of air, unless they have evolved to swim
     if (y > 0 && PHASE[this.mat[i - w]] === Phase.Liquid) {
-      if (this.life[i] > 5) this.life[i] -= 5; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('bug-drown'); return; }
+      const loss = Math.max(0, 5 - (swim >> 1));
+      if (loss === 0) { /* breathes through its skin */ }
+      else if (this.life[i] > loss) this.life[i] -= loss; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('bug-drown'); return; }
+    }
+    // swimmers paddle about in the water instead of sinking
+    if (swim >= 8 && (PHASE[this.mat[i + w < this.n ? i + w : i]] === Phase.Liquid || (y > 0 && PHASE[this.mat[i - w]] === Phase.Liquid))) {
+      const k = this.randNeighbor(x, y);
+      if (k >= 0 && PHASE[this.mat[k]] === Phase.Liquid && !this.one(3)) { const f = this.flags[i]; this.swap(i, k); this.flags[k] = f; return; }
     }
     // gravity
     if (y + 1 < h) {
@@ -578,7 +623,7 @@ export class World {
       }
     }
     // hunger
-    if (this.one(3)) { if (this.life[i] > 0) this.life[i]--; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('starve'); return; } }
+    if (this.one(coat > 7 ? 2 : 3)) { if (this.life[i] > 0) this.life[i]--; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('starve'); return; } }  // a thick coat burns more food
     // eat
     const n = this.randNeighbor(x, y);
     if (n >= 0) {
@@ -587,12 +632,17 @@ export class World {
         this.clear(n); this.life[i] = 255; this.vel[i]++; this.find('bug-eats');
         if (this.vel[i] >= 3) {
           const k = this.randNeighbor(x, y);
-          if (k >= 0 && this.mat[k] === M.Empty) { this.spawn(k, M.Bug); this.life[k] = 160; this.vel[i] = 0; this.find('bug-breeds'); }
+          if (k >= 0 && this.mat[k] === M.Empty) {
+            this.spawn(k, M.Bug); this.life[k] = 160; this.vel[i] = 0; this.find('bug-breeds');
+            this.aux[k] = this.inherit(this.aux[i], T < 8, y + 1 < h && PHASE[this.mat[i + w]] === Phase.Liquid);
+            this.evolved(M.Bug, this.aux[k]);
+          }
         }
         return;
       }
     }
-    // walk and climb
+    // walk and climb (water-adapted bugs are clumsy on land)
+    if (swim >= 8 && !this.one(2)) return;
     const dir = (this.flags[i] & F.DIR) ? 1 : -1, nx = x + dir;
     if (nx < 0 || nx >= w) { this.flags[i] ^= F.DIR; return; }
     const f = i + dir;
@@ -602,7 +652,7 @@ export class World {
   }
   /** Algae: lives only in water, spreads through sunlit water, faster near rich soil or ash. */
   algae(i: number, x: number, y: number) {
-    const T = this.temp[i];
+    const T = this.temp[i], grow = this.aux[i] & 15, dark = this.aux[i] >> 4;
     if (T > 70) { this.become(i, M.Water); return; }
     if (!this.one(4)) return;
     let wet = 0, rich = 0;
@@ -615,14 +665,20 @@ export class World {
     const sub = y > 0 && (this.mat[i - this.w] === M.Water || this.mat[i - this.w] === M.Algae);
     if (!wet && !sub) { if (this.one(30)) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('algae-dries'); } return; }
     const n = this.randNeighbor(x, y);
-    if (n >= 0 && this.mat[n] === M.Water && this.lit(n) && this.one(rich ? 6 : 40)) { this.become(n, M.Algae); this.find('algae-bloom'); return; }
+    if (n >= 0 && this.mat[n] === M.Water && (this.lit(n) || (dark >= 8 && this.one(3))) && this.one(Math.max(2, Math.round((rich ? 6 : 40) * (1 - grow / 18)) + (dark >= 8 ? 4 : 0)))) {
+      this.become(n, M.Algae); this.find('algae-bloom');
+      this.aux[n] = this.inherit(this.aux[i], false, !this.lit(i));  // shade pushes toward low-light algae
+      this.evolved(M.Algae, this.aux[n]);
+      return;
+    }
     // drift in the water
     if (n >= 0 && this.mat[n] === M.Water && this.one(3)) this.swap(i, n);
   }
   /** Fish: swim through water, eat algae and whatever falls in, breed when fed, suffocate in air. */
   fish(i: number, x: number, y: number) {
     const w = this.w, h = this.h, T = this.temp[i];
-    if (T > 45 && !(this.flags[i] & F.BURN)) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-cooked'); return; }
+    const heatTol = this.aux[i] & 15, lungs = this.aux[i] >> 4;
+    if (T > 45 + heatTol * 4 && !(this.flags[i] & F.BURN)) { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-cooked'); return; }
     if (this.combust(i, x, y, M.Fish)) return;
     if (!this.one(2)) return;
     let wet = 0;
@@ -633,7 +689,24 @@ export class World {
     if (!wet) {
       // out of water: flop, fall, gasp
       if (y + 1 < h && (this.mat[i + w] === M.Empty || PHASE[this.mat[i + w]] === Phase.Gas)) { this.swap(i, i + w); return; }
-      if (this.life[i] > 6) this.life[i] -= 6; else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-suffocate'); }
+      const loss = Math.max(1, 6 - (lungs >> 1));
+      if (lungs >= 12 || this.life[i] > loss) { if (lungs < 12) this.life[i] -= loss; } else { this.become(i, M.Dirt); this.flags[i] |= F.FERT; this.find('fish-suffocate'); return; }
+      if (lungs >= 12) {
+        // a fish that has learned to walk: it crawls along the ground and eats what it finds
+        const n = this.randNeighbor(x, y);
+        if (n >= 0 && (this.mat[n] === M.Bug || this.mat[n] === M.Plant || this.mat[n] === M.Seed || this.mat[n] === M.Algae)) {
+          this.clear(n); this.life[i] = 255; this.vel[i]++; this.find('fish-eats');
+          if (this.vel[i] >= 4) {
+            const k = this.randNeighbor(x, y);
+            if (k >= 0 && this.mat[k] === M.Empty) { this.spawn(k, M.Fish); this.life[k] = 180; this.vel[i] = 0; this.aux[k] = this.inherit(this.aux[i]); this.find('fish-breeds'); }
+          }
+          return;
+        }
+        const f = i + ((this.flags[i] & F.DIR) ? 1 : -1);
+        if (Math.abs((f % w) - x) === 1 && this.mat[f] === M.Empty) { const fl = this.flags[i]; this.swap(i, f); this.flags[f] = fl; }
+        else if (this.one(3)) this.flags[i] ^= F.DIR;
+        return;
+      }
       if (this.one(3)) { const f = i + ((this.rnd() & 1) ? 1 : -1); const fx = f % w; if (Math.abs(fx - x) === 1 && this.mat[f] === M.Water) this.swap(i, f); }
       return;
     }
@@ -647,7 +720,11 @@ export class World {
         this.find(t === M.Bug ? 'food-chain' : 'fish-eats');
         if (this.vel[i] >= 4) {
           const k = this.randNeighbor(x, y);
-          if (k >= 0 && this.mat[k] === M.Water) { this.spawn(k, M.Fish); this.life[k] = 180; this.vel[i] = 0; this.find('fish-breeds'); }
+          if (k >= 0 && this.mat[k] === M.Water) {
+            this.spawn(k, M.Fish); this.life[k] = 180; this.vel[i] = 0; this.find('fish-breeds');
+            this.aux[k] = this.inherit(this.aux[i], T > 26, y > 0 && this.mat[i - w] === M.Empty);  // warm water favours heat tolerance, a surface dweller gets lungs
+            this.evolved(M.Fish, this.aux[k]);
+          }
         }
         return;
       }
